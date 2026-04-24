@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+sessions/
+backend/data/*.db
+data/*.db
+backups/
+*.log
+Account Firefox/firefox/
+cookies/
+images/

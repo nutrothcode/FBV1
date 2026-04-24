@@ -1,9 +1,4 @@
-from fbv2_app import FacebookToolApp
-
-
-def main() -> None:
-    app = FacebookToolApp()
-    app.run()
+from Fbv1 import main
 
 
 if __name__ == "__main__":
