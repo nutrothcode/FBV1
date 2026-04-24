@@ -1,0 +1,1 @@
+{"time_last_update":1772730553,"weights":{"frec":0.7,"rece":0.3},"init_weights":{"frec":0.7,"rece":0.3},"norms":{"rece":{"beta":0.001,"mean":6.004464718381919,"var":1.0069835258486253},"frec":{"beta":0.001,"mean":20763.013993,"var":1.09385904500098}},"score_map":{"YcvriFSZ886B":{"frec":6.679567382714871,"rece":2.9839137196261873,"final":5.570871283788266}}}

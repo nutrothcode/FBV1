@@ -1,0 +1,1 @@
+{"time_last_update":1772730581,"weights":{"frec":0.7,"rece":0.3},"init_weights":{"frec":0.7,"rece":0.3},"norms":{"rece":{"beta":0.001,"mean":2.049847341767933,"var":1.3579111321920254},"frec":{"beta":0.001,"mean":20716.423049171164,"var":31.59228689114061}},"score_map":{"bZEimWgWK_lA":{"frec":14.33574596803568,"rece":6.821428821271812,"final":12.08145082400652}}}
