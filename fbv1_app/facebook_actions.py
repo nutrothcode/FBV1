@@ -181,6 +181,293 @@ class FacebookActions:
     def _count_running_instances(self, start_instance: int, end_instance: int) -> int:
         return self.app.browser.count_active_instances(start_instance, end_instance)
 
+    def _int_from_var(self, value, default: int = 0) -> int:
+        try:
+            return max(0, int(float(str(value.get()).strip() or default)))
+        except (TypeError, ValueError):
+            return default
+
+    def _find_clickable(self, driver, locators: list[tuple[str, str]], timeout: float = 4):
+        for by, selector in locators:
+            try:
+                return WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((by, selector)))
+            except Exception:
+                continue
+        return None
+
+    def _find_present(self, driver, locators: list[tuple[str, str]], timeout: float = 4):
+        for by, selector in locators:
+            try:
+                return WebDriverWait(driver, timeout).until(EC.presence_of_element_located((by, selector)))
+            except Exception:
+                continue
+        return None
+
+    def _safe_click(self, driver, element) -> bool:
+        if element is None:
+            return False
+        try:
+            element.click()
+            return True
+        except Exception:
+            try:
+                driver.execute_script("arguments[0].click();", element)
+                return True
+            except Exception:
+                return False
+
+    def _click_by_locators(self, driver, locators: list[tuple[str, str]], timeout: float = 4) -> bool:
+        return self._safe_click(driver, self._find_clickable(driver, locators, timeout))
+
+    def _play_visible_facebook_videos(self, driver) -> None:
+        for video in driver.find_elements(By.CSS_SELECTOR, "video"):
+            try:
+                driver.execute_script(
+                    "arguments[0].muted = true; if (arguments[0].play) { arguments[0].play(); }",
+                    video,
+                )
+            except Exception:
+                continue
+
+    def _click_facebook_like(self, driver) -> bool:
+        return self._click_by_locators(
+            driver,
+            [
+                (By.XPATH, "//*[@role='button' and (@aria-label='Like' or @aria-label='React')]"),
+                (By.CSS_SELECTOR, "[role='button'][aria-label='Like']"),
+                (By.CSS_SELECTOR, "[role='button'][aria-label='React']"),
+            ],
+            timeout=3,
+        )
+
+    def _comment_on_facebook_reel(self, driver, comment: str) -> bool:
+        if not comment:
+            return False
+
+        self._click_by_locators(
+            driver,
+            [
+                (By.XPATH, "//*[@role='button' and @aria-label='Comment']"),
+                (By.CSS_SELECTOR, "[role='button'][aria-label='Comment']"),
+            ],
+            timeout=3,
+        )
+        time.sleep(0.5)
+
+        comment_box = self._find_clickable(
+            driver,
+            [
+                (By.CSS_SELECTOR, "div[role='textbox'][contenteditable='true']"),
+                (By.XPATH, "//*[@contenteditable='true' and @role='textbox']"),
+                (
+                    By.XPATH,
+                    "//*[contains(translate(@aria-label, 'COMMENT', 'comment'), 'comment') and @contenteditable='true']",
+                ),
+            ],
+            timeout=5,
+        )
+        if comment_box is None:
+            comment_box = self._find_present(
+                driver,
+                [(By.CSS_SELECTOR, "div[contenteditable='true'], p[contenteditable='true']")],
+                timeout=2,
+            )
+        if comment_box is None:
+            return False
+
+        self._safe_click(driver, comment_box)
+        self.type_text(comment_box, comment)
+        time.sleep(0.5)
+        try:
+            comment_box.send_keys(Keys.ENTER)
+        except Exception:
+            try:
+                comment_box.send_keys(Keys.CONTROL, Keys.ENTER)
+            except Exception:
+                return False
+        time.sleep(4)
+        return True
+
+    def _share_facebook_reel(self, driver) -> bool:
+        if not self._click_by_locators(
+            driver,
+            [
+                (By.XPATH, "//*[@role='button' and @aria-label='Share']"),
+                (By.CSS_SELECTOR, "[role='button'][aria-label='Share']"),
+            ],
+            timeout=4,
+        ):
+            return False
+        time.sleep(1)
+
+        share_title = self.vars.share_title_var.get().strip() if hasattr(self.vars, "share_title_var") else ""
+        if self._complete_facebook_share_dialog(driver, share_title):
+            return True
+
+        share_options = [
+            "Share to Feed",
+            "Share now (Public)",
+            "Share to your story",
+            "Share now",
+        ]
+        for option in share_options:
+            option_xpath = (
+                "//*[@role='menuitem' or @role='button' or self::span or self::div]"
+                f"[.//*[normalize-space()={option!r}] or normalize-space()={option!r}]"
+            )
+            if self._click_by_locators(driver, [(By.XPATH, option_xpath)], timeout=2):
+                time.sleep(1)
+                if option == "Share to Feed" or share_title:
+                    return self._complete_facebook_share_dialog(driver, share_title)
+                if "Public" in option:
+                    return True
+                if self._share_dialog_privacy_text(driver).lower() == "only me":
+                    return False
+                return True
+
+        try:
+            driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+        except Exception:
+            pass
+        return False
+
+    def _complete_facebook_share_dialog(self, driver, share_title: str = "") -> bool:
+        dialog_ready = self._find_present(
+            driver,
+            [
+                (By.XPATH, "//*[@role='dialog' and .//*[normalize-space()='Share']]"),
+                (By.XPATH, "//*[normalize-space()='Say something about this...']/ancestor::*[@role='dialog'][1]"),
+                (By.XPATH, "//*[@role='button' and @aria-label='Share now']/ancestor::*[@role='dialog'][1]"),
+            ],
+            timeout=4,
+        )
+        if dialog_ready is None:
+            return False
+
+        if not self._ensure_share_privacy_public(driver):
+            return False
+
+        if share_title:
+            self._fill_facebook_share_title(driver, share_title)
+
+        clicked = self._click_by_locators(
+            driver,
+            [
+                (By.XPATH, "//*[@role='button' and @aria-label='Share now']"),
+                (By.XPATH, "//*[@role='button' and .//*[normalize-space()='Share now']]"),
+                (By.XPATH, "//*[normalize-space()='Share now']/ancestor::*[@role='button'][1]"),
+            ],
+            timeout=6,
+        )
+        if clicked:
+            time.sleep(3)
+        return clicked
+
+    def _fill_facebook_share_title(self, driver, share_title: str) -> bool:
+        textbox = self._find_clickable(
+            driver,
+            [
+                (By.XPATH, "//*[@role='dialog']//*[@contenteditable='true' and @role='textbox']"),
+                (By.XPATH, "//*[@role='dialog']//*[contains(@aria-placeholder,'Say something') and @contenteditable='true']"),
+                (By.CSS_SELECTOR, "div[role='dialog'] div[role='textbox'][contenteditable='true']"),
+            ],
+            timeout=4,
+        )
+        if textbox is None:
+            return False
+        self._safe_click(driver, textbox)
+        self.type_text(textbox, share_title)
+        time.sleep(0.3)
+        return True
+
+    def _ensure_share_privacy_public(self, driver) -> bool:
+        privacy_text = self._share_dialog_privacy_text(driver).lower()
+        if "public" in privacy_text:
+            return True
+
+        privacy_button = self._find_clickable(
+            driver,
+            [
+                (By.XPATH, "//*[@role='dialog']//*[@role='button' and contains(@aria-label,'Edit privacy')]"),
+                (By.XPATH, "//*[@role='dialog']//*[@role='button' and contains(@aria-label,'Only me')]"),
+                (By.XPATH, "//*[@role='dialog']//*[normalize-space()='Only me']/ancestor::*[@role='button'][1]"),
+            ],
+            timeout=4,
+        )
+        if privacy_button is None:
+            return False
+        if not self._safe_click(driver, privacy_button):
+            return False
+        time.sleep(0.8)
+
+        public_clicked = self._click_by_locators(
+            driver,
+            [
+                (By.XPATH, "//*[@role='radio' and (@aria-label='Public' or .//*[normalize-space()='Public'])]"),
+                (By.XPATH, "//*[@role='button' and (@aria-label='Public' or .//*[normalize-space()='Public'])]"),
+                (By.XPATH, "//*[normalize-space()='Public']/ancestor::*[@role='radio' or @role='button'][1]"),
+                (By.XPATH, "//*[normalize-space()='Public']"),
+            ],
+            timeout=5,
+        )
+        if not public_clicked:
+            return False
+        time.sleep(0.5)
+
+        self._click_by_locators(
+            driver,
+            [
+                (By.XPATH, "//*[@role='button' and (@aria-label='Done' or .//*[normalize-space()='Done'])]"),
+                (By.XPATH, "//*[@role='button' and (@aria-label='Save' or .//*[normalize-space()='Save'])]"),
+            ],
+            timeout=2,
+        )
+        time.sleep(0.5)
+        privacy_text = self._share_dialog_privacy_text(driver).lower()
+        if privacy_text:
+            return "public" in privacy_text
+        return public_clicked
+
+    def _share_dialog_privacy_text(self, driver) -> str:
+        try:
+            elements = driver.find_elements(
+                By.XPATH,
+                "//*[@role='dialog']//*[@role='button' and (contains(@aria-label,'Sharing') or contains(@aria-label,'privacy') or contains(.,'Only me') or contains(.,'Public'))]",
+            )
+            for element in elements:
+                label = str(element.get_attribute("aria-label") or "").strip()
+                text = str(element.text or "").strip()
+                combined = " ".join(part for part in (label, text) if part)
+                if "Only me" in combined or "Public" in combined:
+                    return combined
+        except Exception:
+            return ""
+        return ""
+
+    def _advance_facebook_reel(self, driver) -> bool:
+        if self._click_by_locators(
+            driver,
+            [
+                (By.XPATH, "//*[@role='button' and @aria-label='Next Card']"),
+                (By.CSS_SELECTOR, "[role='button'][aria-label='Next Card']"),
+                (
+                    By.XPATH,
+                    "//*[local-name()='path' and @d='m15.293 10.293-2.94 2.94a.5.5 0 0 1-.707 0l-2.939-2.94a1 1 0 0 0-1.414 1.414l2.94 2.94a2.5 2.5 0 0 0 3.535 0l2.94-2.94a1 1 0 0 0-1.415-1.414z']/ancestor::*[@role='button'][1]",
+                ),
+            ],
+            timeout=1,
+        ):
+            return True
+        try:
+            driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ARROW_DOWN)
+            return True
+        except Exception:
+            try:
+                driver.execute_script("window.scrollBy(0, Math.max(500, window.innerHeight * 0.8));")
+                return True
+            except Exception:
+                return False
+
     def watch_facebook_videos(self, instance_numbers: list[int]) -> None:
         for instance_number in instance_numbers:
             driver = self.state.drivers.get(instance_number)
@@ -188,98 +475,46 @@ class FacebookActions:
                 self.state.run_summary.append(f"Instance {instance_number}: Error - Firefox {instance_number} is not running.")
                 continue
 
-            try:
-                video_count = int(self.vars.watch_count_var.get())
-                duration_per_video = int(self.vars.watch_duration_var.get())
-            except ValueError:
-                self.state.run_summary.append(f"Instance {instance_number}: Error - Invalid watch count or duration.")
+            video_count = self._int_from_var(self.vars.watch_count_var, default=1)
+            duration_per_video = self._int_from_var(self.vars.watch_duration_var, default=30)
+            scroll_duration = self._int_from_var(self.vars.scroll_duration_var, default=0)
+            if video_count <= 0:
+                self.state.run_summary.append(f"Instance {instance_number}: Error - Watch count must be greater than 0.")
                 continue
 
             video_links = [link.strip() for link in self.vars.video_link_var.get().strip().split(",") if link.strip()]
             if not video_links:
-                video_links = ["https://www.facebook.com/watch"]
+                video_links = ["https://www.facebook.com/reel/"]
 
             for i in range(video_count):
                 video_link = video_links[i % len(video_links)]
-                driver.get(video_link)
-                start_time = time.time()
+                try:
+                    driver.get(video_link)
+                    WebDriverWait(driver, 12).until(lambda browser: browser.find_elements(By.CSS_SELECTOR, "video"))
+                    watch_end_time = time.time() + duration_per_video
+                    while time.time() < watch_end_time:
+                        self._play_visible_facebook_videos(driver)
+                        time.sleep(0.5)
+                except Exception as exc:
+                    self.state.run_summary.append(f"Instance {instance_number}: Error opening video {video_link}: {exc}")
+                    continue
 
-                while time.time() - start_time < duration_per_video:
-                    try:
-                        video_element = WebDriverWait(driver, 10).until(
-                            EC.presence_of_element_located((By.CSS_SELECTOR, "video"))
-                        )
-                        driver.execute_script("arguments[0].play();", video_element)
+                if self.vars.like_video_var.get() and not self._click_facebook_like(driver):
+                    self.state.run_summary.append(f"Instance {instance_number}: Warning - Like button not found.")
 
-                        if self.vars.link_video_var.get():
-                            if self.vars.like_video_var.get():
-                                try:
-                                    driver.find_element(
-                                        By.XPATH,
-                                        "//div[@class='x1ey2m1c xds687c x17qophe xg01cxk x47corl x10l6tqk x13vifvy x1ebt8du x19991ni x1dhq9h x1o1ewxj x3x9cwd x1e5q0jg x13rtm0m']",
-                                    ).click()
-                                except Exception as exc:
-                                    self.state.run_summary.append(f"Instance {instance_number}: Error liking video: {exc}")
+                if self.vars.comment_video_var.get():
+                    comment = self.vars.comment_text_var.get().strip()
+                    if comment and not self._comment_on_facebook_reel(driver, comment):
+                        self.state.run_summary.append(f"Instance {instance_number}: Warning - Comment box not found.")
 
-                            if self.vars.comment_video_var.get():
-                                try:
-                                    comment = self.vars.comment_text_var.get().strip()
-                                    if comment:
-                                        comment_box = WebDriverWait(driver, 10).until(
-                                            EC.element_to_be_clickable(
-                                                (By.XPATH, "//p[@class='xdj266r x11i5rnm xat24cr x1mh8g0r']")
-                                            )
-                                        )
-                                        comment_box.click()
-                                        comment_box = WebDriverWait(driver, 10).until(
-                                            EC.presence_of_element_located(
-                                                (By.XPATH, "//p[@class='xdj266r x11i5rnm xat24cr x1mh8g0r']/parent::div")
-                                            )
-                                        )
-                                        self.type_text(comment_box, comment)
-                                        WebDriverWait(driver, 10).until(
-                                            EC.element_to_be_clickable(
-                                                (By.XPATH, "//div[@aria-label='Comment' and @role='button']")
-                                            )
-                                        ).click()
-                                except Exception as exc:
-                                    self.state.run_summary.append(
-                                        f"Instance {instance_number}: Error commenting on video: {exc}"
-                                    )
-
-                            if self.vars.share_video_var.get():
-                                try:
-                                    driver.find_element(
-                                        By.XPATH,
-                                        "//div[@class='x9f619 x1n2onr6 x1ja2u2z x78zum5 x1ey2m1c xds687c x17qophe xg01cxk x47corl x10l6tqk x13vifvy x1ebt8du x19991ni x1dhq9h x1o1ewxj x3x9cwd x1e5q0jg x13rtm0m']",
-                                    ).click()
-                                    WebDriverWait(driver, 10).until(
-                                        EC.element_to_be_clickable((By.XPATH, "//i[@class='x1b0d499 xi3auck']"))
-                                    ).click()
-                                    WebDriverWait(driver, 10).until(
-                                        EC.element_to_be_clickable(
-                                            (By.XPATH, "//span[@class='x1lliihq x6ikm8r x10wlt62 x1n2onr6 xlyipyv xuxw1ft']")
-                                        )
-                                    ).click()
-                                except Exception as exc:
-                                    self.state.run_summary.append(f"Instance {instance_number}: Error sharing video: {exc}")
-
-                        time.sleep(5)
-                    except Exception as exc:
-                        self.state.run_summary.append(f"Instance {instance_number}: Error during video watch: {exc}")
-                        break
+                if self.vars.share_video_var.get() and not self._share_facebook_reel(driver):
+                    self.state.run_summary.append(f"Instance {instance_number}: Warning - Share option not found.")
 
                 if self.vars.scroll_var.get():
-                    try:
-                        scroll_duration = int(self.vars.scroll_duration_var.get())
-                    except ValueError:
-                        self.state.run_summary.append(f"Instance {instance_number}: Error - Invalid scroll duration.")
-                        break
-
                     scroll_end_time = time.time() + scroll_duration
                     while time.time() < scroll_end_time:
-                        driver.execute_script("window.scrollBy(0, 1);")
-                        time.sleep(0.01)
+                        self._advance_facebook_reel(driver)
+                        time.sleep(1)
 
             self.state.run_summary.append(f"Instance {instance_number}: Success - Watched {video_count} videos.")
 

@@ -128,6 +128,7 @@ class AccountStateStore:
                 "browser_mode": str(data.get("browser_mode") or "pc"),
                 "platform_mode": str(data.get("platform_mode") or "facebook"),
                 "thread_count": str(data.get("thread_count") or "3"),
+                "platform_states": json.dumps(data.get("platform_states", {})),
                 "last_saved_at": now,
             }
             for key, value in settings.items():
@@ -165,9 +166,16 @@ class AccountStateStore:
             "browser_mode": settings.get("browser_mode", "pc"),
             "platform_mode": settings.get("platform_mode", "facebook"),
             "thread_count": settings.get("thread_count", "3"),
+            "platform_states": {},
             "deleted_instances": [],
             "active_instances": [],
         }
+        try:
+            platform_states = json.loads(settings.get("platform_states", "{}"))
+        except json.JSONDecodeError:
+            platform_states = {}
+        if isinstance(platform_states, dict):
+            data["platform_states"] = platform_states
 
         for row in rows:
             instance_number = int(row["instance_number"])

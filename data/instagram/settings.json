@@ -1,0 +1,14 @@
+{
+  "platform": "instagram",
+  "title": "Instagram Workspace",
+  "import_format": "Username|Password|2FA|Proxy|InstagramUsername|InstagramUserID",
+  "country_types": [
+    "All",
+    "Cambodia",
+    "Canada"
+  ],
+  "custom_account_types": [
+    "All",
+    "ACC"
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "platform": "wordpress",
+  "title": "WordPress Workspace",
+  "import_format": "SiteURL|Username|ApplicationPasswordOrApiToken|DefaultCategory|Proxy",
+  "country_types": [
+    "All",
+    "Cambodia",
+    "Canada"
+  ],
+  "custom_account_types": [
+    "All",
+    "ACC"
+  ]
+}

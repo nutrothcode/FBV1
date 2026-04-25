@@ -23,11 +23,10 @@ from selenium.webdriver.support.ui import WebDriverWait
 from PIL import Image
 
 from .config import (
-    COOKIE_DIR,
-    FIREFOX_USER_DATA_DIR,
     GECKODRIVER_PATH,
     avatar_image_path,
     cover_image_path,
+    cookie_dir_for_platform,
     facebook_screenshot_path,
     image_account_dir,
 )
@@ -67,6 +66,8 @@ class BrowserManager:
         start_url: str | None = None,
         sync_preview: bool = True,
     ) -> None:
+        if not self.app.instances.allow_open_for_expected_country(instance_number):
+            return
         assigned_slot: int | None = None
         requested_mode = self._current_browser_mode()
         self.app.instances.set_run_status(instance_number, "Launching", WARNING)
@@ -97,7 +98,9 @@ class BrowserManager:
                     self._apply_window_layout(existing_driver, instance_number)
                     self._apply_browser_mode_after_launch(existing_driver)
                     if start_url:
-                        existing_driver.get(start_url)
+                        current_url = str(existing_driver.current_url or "")
+                        if current_url.rstrip("/") != str(start_url).rstrip("/"):
+                            existing_driver.get(start_url)
                     logging.info("Firefox %s launch skipped (already running).", instance_number)
                     self.app.instances.set_run_status(instance_number, "Running", SUCCESS)
                     return
@@ -114,7 +117,7 @@ class BrowserManager:
         try:
             firefox_options = FirefoxOptions()
 
-            user_data_dir = FIREFOX_USER_DATA_DIR / f"Firefox_{instance_number}"
+            user_data_dir = self.app.instances.firefox_profile_dir(instance_number)
             user_data_dir.mkdir(parents=True, exist_ok=True)
             firefox_options.add_argument("-profile")
             firefox_options.add_argument(str(user_data_dir))
@@ -616,12 +619,20 @@ class BrowserManager:
 
     def _sync_profile_identity_from_current_page(self, instance_number: int, driver) -> bool:
         try:
+            profile_name = self._extract_profile_name_from_current_page(driver)
             account_id = self._extract_account_id_from_driver(driver)
             source = str(getattr(driver, "page_source", "") or "")
             body_text = self._safe_body_text(driver)
-            date_birth = self._extract_date_birth_from_text_or_source(source, body_text)
-            gender = self._extract_gender_from_text_or_source(source, body_text)
-            gmail = self._extract_gmail_from_text_or_source(source, body_text)
+            center_profile_name, center_date_birth, center_gmail = self._extract_accounts_center_identity_from_visible_text(body_text)
+            if not profile_name:
+                profile_name = center_profile_name
+            date_birth = center_date_birth or self._extract_date_birth_from_text_or_source(source, body_text)
+            gender = self._extract_gender_from_visible_page(driver)
+            if not gender:
+                gender = self._extract_gender_from_text_or_source(source, body_text)
+            gmail = center_gmail or self._extract_gmail_from_text_or_source(source, body_text)
+            if profile_name:
+                self.app.instances.set_profile_name(instance_number, profile_name)
             if account_id:
                 self.app.instances.set_account_id(instance_number, account_id)
             self.app.instances.set_profile_identity(
@@ -630,10 +641,31 @@ class BrowserManager:
                 gender=gender,
                 gmail=gmail,
             )
-            return bool(account_id or date_birth or gender or gmail)
+            return bool(profile_name or account_id or date_birth or gender or gmail)
         except Exception as exc:
             logging.debug("Current-page identity sync failed for Firefox %s: %s", instance_number, exc)
             return False
+
+    def _extract_profile_name_from_current_page(self, driver) -> str:
+        try:
+            profile_name_element = self._find_profile_name_element(driver)
+            if profile_name_element:
+                name = str(profile_name_element.text or "").strip()
+                if name and not self._looks_generic_name(name):
+                    return name
+        except Exception:
+            pass
+
+        try:
+            title = str(driver.title or "").strip()
+        except Exception:
+            title = ""
+        if title:
+            title = re.sub(r"^\(\d+\)\s*", "", title).strip()
+            title = re.sub(r"\s*\|\s*Facebook\s*$", "", title, flags=re.IGNORECASE).strip()
+            if title and not self._looks_generic_name(title):
+                return title
+        return ""
 
     def _extract_account_id_from_driver(self, driver) -> str | None:
         # Best source for logged-in sessions.
@@ -697,13 +729,14 @@ class BrowserManager:
                 time.sleep(1.6)
                 page_source = str(getattr(driver, "page_source", "") or "")
                 body_text = self._safe_body_text(driver)
+                _center_profile_name, center_date_birth, center_gmail = self._extract_accounts_center_identity_from_visible_text(body_text)
 
                 if not date_birth:
-                    date_birth = self._extract_date_birth_from_text_or_source(page_source, body_text)
+                    date_birth = center_date_birth or self._extract_date_birth_from_text_or_source(page_source, body_text)
                 if not gender:
                     gender = self._extract_gender_from_text_or_source(page_source, body_text)
                 if not gmail:
-                    gmail = self._extract_gmail_from_text_or_source(page_source, body_text)
+                    gmail = center_gmail or self._extract_gmail_from_text_or_source(page_source, body_text)
 
                 if date_birth and gender and gmail:
                     break
@@ -713,9 +746,15 @@ class BrowserManager:
         # About page usually has explicit birthday/gender text.
         about_urls = []
         if account_id.isdigit():
-            about_urls.append(f"https://www.facebook.com/profile.php?id={account_id}&sk=about_contact_and_basic_info")
+            about_urls.extend(
+                [
+                    f"https://www.facebook.com/profile.php?id={account_id}&sk=directory_personal_details",
+                    f"https://www.facebook.com/profile.php?id={account_id}&sk=about_contact_and_basic_info",
+                ]
+            )
         about_urls.extend(
             [
+                "https://www.facebook.com/me/about_details",
                 "https://www.facebook.com/me/about_contact_and_basic_info",
                 "https://www.facebook.com/me/about",
             ]
@@ -732,6 +771,8 @@ class BrowserManager:
                     date_birth = self._extract_date_birth_from_text_or_source(page_source, body_text)
                 if not gender:
                     gender = self._extract_gender_from_text_or_source(page_source, body_text)
+                if not gender:
+                    gender = self._extract_gender_from_visible_page(driver)
                 if not gmail:
                     gmail = self._extract_gmail_from_text_or_source(page_source, body_text)
                 if date_birth and gender and gmail:
@@ -746,6 +787,46 @@ class BrowserManager:
             return str(driver.execute_script("return document.body ? document.body.innerText : '';") or "")
         except Exception:
             return ""
+
+    def _extract_accounts_center_identity_from_visible_text(self, body_text: str) -> tuple[str, str, str]:
+        lines = [line.strip() for line in str(body_text or "").splitlines() if line.strip()]
+        profile_name = ""
+        date_birth = ""
+        email = ""
+        for index, line in enumerate(lines):
+            label = line.lower()
+            if label == "profiles" and not profile_name:
+                for candidate in lines[index + 1 : index + 8]:
+                    if candidate.lower() in {"facebook", "add accounts"}:
+                        continue
+                    if "@" in candidate:
+                        continue
+                    if not self._looks_generic_name(candidate):
+                        profile_name = candidate
+                        break
+            elif label == "contact info" and not email:
+                for candidate in lines[index + 1 : index + 5]:
+                    extracted = self._extract_gmail_from_text_or_source("", candidate)
+                    if extracted:
+                        email = extracted
+                        break
+            elif label == "birthday" and not date_birth:
+                for candidate in lines[index + 1 : index + 4]:
+                    if re.search(r"\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b", candidate, flags=re.IGNORECASE):
+                        date_birth = candidate
+                        break
+                    if re.search(r"\b\d{1,2}[/-]\d{1,2}[/-](?:19|20)\d{2}\b", candidate):
+                        date_birth = candidate
+                        break
+        if not email:
+            contact_match = re.search(r"Contact info\s*\n\s*([^\n]+@[^\n]+)", body_text or "", flags=re.IGNORECASE)
+            if contact_match:
+                email = self._extract_gmail_from_text_or_source("", contact_match.group(1))
+        if not date_birth:
+            birthday_match = re.search(r"Birthday\s*\n\s*([^\n]+)", body_text or "", flags=re.IGNORECASE)
+            if birthday_match:
+                date_birth = birthday_match.group(1).strip()
+        return profile_name, date_birth, email
 
     def _extract_date_birth_from_text_or_source(self, source: str, body_text: str) -> str:
         # JSON-ish payload pattern
@@ -810,6 +891,45 @@ class BrowserManager:
             return self._normalize_gender(match.group(1))
         return ""
 
+    def _extract_gender_from_visible_page(self, driver) -> str:
+        try:
+            body_text = self._safe_body_text(driver)
+            gender = self._extract_gender_from_visible_text(body_text)
+            if gender:
+                return gender
+        except Exception:
+            pass
+
+        xpath_candidates = (
+            "//*[normalize-space()='Gender']/following::*[normalize-space()='Female' or normalize-space()='Male' or normalize-space()='Custom'][1]",
+            "//*[normalize-space()='Female' or normalize-space()='Male' or normalize-space()='Custom'][following::*[normalize-space()='Gender'] or preceding::*[normalize-space()='Gender']]",
+        )
+        for xpath in xpath_candidates:
+            try:
+                for element in driver.find_elements(By.XPATH, xpath):
+                    text = str(element.text or "").strip()
+                    gender = self._normalize_gender(text)
+                    if gender in {"Female", "Male", "Custom"}:
+                        return gender
+            except Exception:
+                continue
+        return ""
+
+    def _extract_gender_from_visible_text(self, text: str) -> str:
+        lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+        for index, line in enumerate(lines):
+            if line.lower() != "gender":
+                continue
+            for candidate in lines[index + 1 : index + 5]:
+                gender = self._normalize_gender(candidate)
+                if gender in {"Female", "Male", "Custom"}:
+                    return gender
+        compact = "\n".join(lines)
+        match = re.search(r"\bGender\s*\n\s*(Female|Male|Custom)\b", compact, flags=re.IGNORECASE)
+        if match:
+            return self._normalize_gender(match.group(1))
+        return ""
+
     def _extract_gmail_from_text_or_source(self, source: str, body_text: str) -> str:
         candidates: list[str] = []
         source_text = unescape(str(source or "")).replace("\\/", "/")
@@ -826,6 +946,8 @@ class BrowserManager:
                 candidates.append(str(match).strip())
 
         for match in re.findall(email_pattern, source_text):
+            candidates.append(str(match).strip())
+        for match in re.findall(email_pattern, body):
             candidates.append(str(match).strip())
 
         text_patterns = [
@@ -872,10 +994,12 @@ class BrowserManager:
         raw = str(value or "").strip().replace("_", " ").lower()
         if not raw:
             return ""
-        if "male" in raw:
-            return "Male"
-        if "female" in raw:
+        if raw == "female" or re.search(r"\bfemale\b", raw):
             return "Female"
+        if raw == "male" or re.search(r"\bmale\b", raw):
+            return "Male"
+        if raw == "custom" or re.search(r"\bcustom\b", raw):
+            return "Custom"
         return raw.title()
 
     def _extract_numeric_id_from_url(self, url: str) -> str | None:
@@ -1455,11 +1579,19 @@ class BrowserManager:
                 pass
 
     def _cookie_file(self, instance_number: int) -> Path:
-        return COOKIE_DIR / f"cookies_{instance_number}.json"
+        platform = self.app.vars.platform_var.get()
+        return cookie_dir_for_platform(platform) / f"cookies_{instance_number}.json"
 
     def _is_logged_in(self, driver) -> bool:
-        if "login" in driver.current_url or "checkpoint" in driver.current_url:
+        current_url = str(driver.current_url or "").lower()
+        if "login" in current_url or "checkpoint" in current_url:
             return False
+        if self.app.vars.platform_var.get() == "facebook":
+            try:
+                cookie = driver.get_cookie("c_user")
+                return bool(cookie and str(cookie.get("value", "")).strip().isdigit())
+            except Exception:
+                return False
         return not driver.find_elements(By.ID, "email")
 
     def _start_manual_login_monitor(
@@ -1496,6 +1628,7 @@ class BrowserManager:
                             self.save_cookies(driver, instance_number)
                             self.try_sync_profile_preview(instance_number)
                             self._sync_profile_identity_from_driver(instance_number, driver, restore_url=True)
+                            self.app.instances.check_live_instance(instance_number, self.app.vars.platform_var.get())
                         return
                 except Exception as exc:
                     logging.debug("Manual login monitor error for Firefox %s: %s", instance_number, exc)
@@ -1505,6 +1638,11 @@ class BrowserManager:
             if self.state.preview_monitor_tokens.get(instance_number) == token:
                 self.app.instances.set_preview_status(instance_number, "Login not detected", WARNING)
                 self.app.instances.set_run_status(instance_number, "Login timeout", WARNING)
+                self.app.instances.set_account_health(
+                    instance_number,
+                    "Login required",
+                    "Login was not detected before the monitor timed out.",
+                )
 
         threading.Thread(target=monitor, daemon=True).start()
 

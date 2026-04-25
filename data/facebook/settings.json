@@ -1,0 +1,14 @@
+{
+  "platform": "facebook",
+  "title": "Facebook Workspace",
+  "import_format": "Mail|Password|2FA|Proxy|FacebookName|FacebookID",
+  "country_types": [
+    "All",
+    "Cambodia",
+    "Canada"
+  ],
+  "custom_account_types": [
+    "All",
+    "ACC"
+  ]
+}

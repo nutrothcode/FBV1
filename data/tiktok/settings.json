@@ -1,0 +1,14 @@
+{
+  "platform": "tiktok",
+  "title": "TikTok Workspace",
+  "import_format": "Username|Password|2FA|Proxy|TikTokUsername|TikTokUserID",
+  "country_types": [
+    "All",
+    "Cambodia",
+    "Canada"
+  ],
+  "custom_account_types": [
+    "All",
+    "ACC"
+  ]
+}

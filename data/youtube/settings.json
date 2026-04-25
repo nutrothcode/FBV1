@@ -1,0 +1,14 @@
+{
+  "platform": "youtube",
+  "title": "YouTube Workspace",
+  "import_format": "Gmail|Password|2FA|Proxy|ChannelName|ChannelID|ChannelURL",
+  "country_types": [
+    "All",
+    "Cambodia",
+    "Canada"
+  ],
+  "custom_account_types": [
+    "All",
+    "ACC"
+  ]
+}

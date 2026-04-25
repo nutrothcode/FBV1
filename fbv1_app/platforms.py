@@ -1,0 +1,234 @@
+from __future__ import annotations
+
+from typing import Any
+
+
+PLATFORM_CONFIG: dict[str, dict[str, Any]] = {
+    "facebook": {
+        "label": "Facebook",
+        "title": "Facebook Workspace",
+        "folder": "data/facebook",
+        "home_url": "https://www.facebook.com",
+        "check_url": "https://www.facebook.com/me",
+        "import_format": "Mail|Password|2FA|Proxy|FacebookName|FacebookID",
+        "columns": [
+            ("instance", "Firefox", 100),
+            ("local_account", "Local Account", 130),
+            ("country_type", "Country Type", 110),
+            ("account_type", "Account Type", 130),
+            ("expected_country", "Expected Country", 130),
+            ("facebook_session", "Facebook Session", 160),
+            ("profile", "Account Name", 170),
+            ("account_id", "Account ID", 140),
+            ("ip", "IP", 130),
+            ("country", "Current Country", 130),
+            ("status", "Account State", 120),
+            ("reason", "Reason", 230),
+            ("checked", "Checked", 160),
+            ("time", "Time", 120),
+            ("note", "Note", 220),
+        ],
+        "actions": [
+            ("Login", "login"),
+            ("Care", "care"),
+            ("Clear Data", "clear_data"),
+            ("Join Group", "join_group"),
+            ("Upload Reel", "upload_reel"),
+            ("Share to Groups", "share_to_groups"),
+            ("Get ID", "get_id"),
+            ("Change Gmail", "get_gmail"),
+            ("Date Create FB", "get_date"),
+            ("Upload Photo+Cover", "upload_photo_cover"),
+        ],
+        "action_urls": {},
+    },
+    "tiktok": {
+        "label": "TikTok",
+        "title": "TikTok Workspace",
+        "folder": "data/tiktok",
+        "home_url": "https://www.tiktok.com",
+        "check_url": "https://www.tiktok.com",
+        "import_format": "Username|Password|2FA|Proxy|TikTokUsername|TikTokUserID",
+        "columns": [
+            ("instance", "Firefox", 100),
+            ("local_account", "Local Account", 130),
+            ("country_type", "Country Type", 110),
+            ("account_type", "Account Type", 130),
+            ("expected_country", "Expected Country", 130),
+            ("tiktok_session", "TikTok Session", 170),
+            ("tiktok_username", "TikTok Username", 170),
+            ("tiktok_user_id", "TikTok User ID", 140),
+            ("ip", "IP", 130),
+            ("country", "Current Country", 130),
+            ("status", "Account State", 120),
+            ("reason", "Reason", 260),
+            ("checked", "Checked", 160),
+            ("time", "Time", 120),
+            ("note", "Note", 220),
+        ],
+        "actions": [
+            ("Open TikTok", "open_home"),
+            ("Check TikTok Login", "check_login"),
+            ("Publish Tool", "publish_tool"),
+            ("Upload Video", "upload_video"),
+            ("Profile", "open_profile"),
+            ("Inbox", "open_inbox"),
+            ("Analytics", "open_analytics"),
+        ],
+        "action_urls": {
+            "open_home": "https://www.tiktok.com",
+            "check_login": "https://www.tiktok.com",
+            "publish_tool": "https://www.tiktok.com/upload",
+            "upload_video": "https://www.tiktok.com/upload",
+            "open_profile": "https://www.tiktok.com/profile",
+            "open_inbox": "https://www.tiktok.com/messages",
+            "open_analytics": "https://www.tiktok.com/analytics",
+        },
+    },
+    "youtube": {
+        "label": "YouTube",
+        "title": "YouTube Workspace",
+        "folder": "data/youtube",
+        "home_url": "https://www.youtube.com",
+        "check_url": "https://www.youtube.com",
+        "import_format": "Gmail|Password|2FA|Proxy|ChannelName|ChannelID|ChannelURL",
+        "columns": [
+            ("instance", "Firefox", 100),
+            ("local_account", "Local Account", 130),
+            ("country_type", "Country Type", 110),
+            ("expected_country", "Expected Country", 130),
+            ("gmail_login", "Gmail Login", 130),
+            ("gmail", "Gmail Email", 220),
+            ("youtube_channel_name", "YouTube Channel Name", 190),
+            ("channel_id", "Channel ID", 160),
+            ("channel_url", "Channel URL", 220),
+            ("brand_channel", "Brand Channel", 130),
+            ("ip", "IP", 130),
+            ("country", "Current Country", 130),
+            ("status", "Account State", 120),
+            ("reason", "Reason", 260),
+            ("checked", "Checked", 160),
+            ("time", "Time", 120),
+            ("note", "Note", 220),
+        ],
+        "actions": [
+            ("Open YouTube", "open_home"),
+            ("Check Gmail Login", "check_gmail"),
+            ("Check YouTube Channel", "check_channel"),
+            ("YouTube Studio", "open_studio"),
+            ("Upload Video", "upload_video"),
+            ("Shorts", "open_shorts"),
+            ("Analytics", "open_analytics"),
+        ],
+        "action_urls": {
+            "open_home": "https://www.youtube.com",
+            "check_gmail": "https://accounts.google.com",
+            "check_channel": "https://studio.youtube.com",
+            "publish_tool": "https://studio.youtube.com/channel/UC/videos/upload",
+            "open_studio": "https://studio.youtube.com",
+            "upload_video": "https://studio.youtube.com/channel/UC/videos/upload",
+            "open_shorts": "https://www.youtube.com/shorts",
+            "open_analytics": "https://studio.youtube.com/analytics",
+        },
+    },
+    "instagram": {
+        "label": "Instagram",
+        "title": "Instagram Workspace",
+        "folder": "data/instagram",
+        "home_url": "https://www.instagram.com",
+        "check_url": "https://www.instagram.com/accounts/edit/",
+        "import_format": "Username|Password|2FA|Proxy|InstagramUsername|InstagramUserID",
+        "columns": [
+            ("instance", "Firefox", 100),
+            ("local_account", "Local Account", 130),
+            ("country_type", "Country Type", 110),
+            ("account_type", "Account Type", 130),
+            ("expected_country", "Expected Country", 130),
+            ("instagram_session", "Instagram Session", 180),
+            ("instagram_username", "Instagram Username", 180),
+            ("instagram_user_id", "Instagram User ID", 150),
+            ("ip", "IP", 130),
+            ("country", "Current Country", 130),
+            ("status", "Account State", 120),
+            ("reason", "Reason", 260),
+            ("checked", "Checked", 160),
+            ("time", "Time", 120),
+            ("note", "Note", 220),
+        ],
+        "actions": [
+            ("Open Instagram", "open_home"),
+            ("Check Instagram Login", "check_login"),
+            ("Create Post", "create_post"),
+            ("Reels", "open_reels"),
+            ("Profile", "open_profile"),
+            ("Messages", "open_messages"),
+        ],
+        "action_urls": {
+            "open_home": "https://www.instagram.com",
+            "check_login": "https://www.instagram.com/accounts/edit/",
+            "publish_tool": "https://www.instagram.com",
+            "create_post": "https://www.instagram.com",
+            "open_reels": "https://www.instagram.com/reels",
+            "open_profile": "https://www.instagram.com/accounts/edit/",
+            "open_messages": "https://www.instagram.com/direct/inbox/",
+        },
+    },
+    "wordpress": {
+        "label": "WordPress",
+        "title": "WordPress Workspace",
+        "folder": "data/wordpress",
+        "home_url": "https://wordpress.com",
+        "check_url": "https://wordpress.com/me",
+        "import_format": "SiteURL|Username|ApplicationPasswordOrApiToken|DefaultCategory|Proxy",
+        "columns": [
+            ("instance", "Firefox", 100),
+            ("local_account", "Local Account", 130),
+            ("website_name", "Website Name", 170),
+            ("wordpress_site_url", "WordPress Site URL", 220),
+            ("wordpress_username", "WordPress Username", 170),
+            ("author_name", "Author Name", 160),
+            ("posting_type", "Posting Type", 140),
+            ("default_category", "Default Category", 150),
+            ("api_login_status", "API/Login Status", 140),
+            ("ip", "IP", 130),
+            ("country", "Current Country", 130),
+            ("status", "Account State", 120),
+            ("reason", "Reason", 260),
+            ("checked", "Checked", 160),
+            ("time", "Time", 120),
+            ("note", "Note", 220),
+        ],
+        "actions": [
+            ("Open WordPress Site", "open_home"),
+            ("Open WordPress Admin", "open_admin"),
+            ("Check API Login", "check_api"),
+            ("Post Article", "post_article"),
+        ],
+        "action_urls": {
+            "open_home": "https://wordpress.com",
+            "open_admin": "https://wordpress.com/home",
+            "check_api": "https://wordpress.com/me",
+            "post_article": "https://wordpress.com/post",
+        },
+    },
+}
+
+PLATFORM_ORDER = ("facebook", "tiktok", "youtube", "instagram", "wordpress")
+PLATFORM_CHOICES = tuple((PLATFORM_CONFIG[key]["label"], key) for key in PLATFORM_ORDER)
+
+
+def platform_label(platform: str) -> str:
+    return str(PLATFORM_CONFIG.get(platform, PLATFORM_CONFIG["facebook"])["label"])
+
+
+def platform_title(platform: str) -> str:
+    return str(PLATFORM_CONFIG.get(platform, PLATFORM_CONFIG["facebook"])["title"])
+
+
+def platform_columns(platform: str) -> list[tuple[str, str, int]]:
+    return list(PLATFORM_CONFIG.get(platform, PLATFORM_CONFIG["facebook"])["columns"])
+
+
+def platform_actions(platform: str) -> list[tuple[str, str]]:
+    return list(PLATFORM_CONFIG.get(platform, PLATFORM_CONFIG["facebook"])["actions"])
+

@@ -56,6 +56,7 @@ class AppVars:
         self.scroll_duration_var = StringVar(master=root)
         self.like_count_var = StringVar(master=root)
         self.comment_text_var = StringVar(master=root)
+        self.share_title_var = StringVar(master=root)
         self.video_link_var = StringVar(master=root)
         self.group_urls_var = StringVar(master=root)
         self.description_var = StringVar(master=root)
