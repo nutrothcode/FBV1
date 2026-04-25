@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import importlib.util
 import json
+import math
 import os
 import csv
 import threading
+import time
 import tkinter as tk
 import tkinter.ttk as ttk
 import urllib.error
@@ -33,7 +36,7 @@ import pandas as pd
 from PIL import Image, ImageTk
 
 from .browser_manager import BrowserManager
-from .config import ICON_PATH, LOGO_PATH
+from .config import ICON_PATH, LOGO_PATH, PLATFORM_FOLDER_DIRS
 from .facebook_actions import FacebookActions
 from .instance_manager import InstanceManager
 from .state import AppState, AppVars
@@ -63,10 +66,39 @@ from .theme import (
     TEXT_PRIMARY,
     TEXT_SUBTLE,
     TITLE_FONT,
+    WARNING,
 )
 
 
 class FacebookToolApp:
+    THEME_PALETTES = {
+        "dark": {
+            "app": APP_BG,
+            "surface": SURFACE_BG,
+            "alt": SURFACE_ALT,
+            "border": BORDER,
+            "text": TEXT_PRIMARY,
+            "muted": TEXT_MUTED,
+            "subtle": TEXT_SUBTLE,
+            "input_bg": INPUT_BG,
+            "input_fg": "#082a39",
+            "button_bg": SECONDARY,
+            "button_hover": "#1a5369",
+        },
+        "light": {
+            "app": "#eef3f7",
+            "surface": "#ffffff",
+            "alt": "#f5f8fb",
+            "border": "#cbd5e1",
+            "text": "#0f172a",
+            "muted": "#475569",
+            "subtle": "#64748b",
+            "input_bg": "#ffffff",
+            "input_fg": "#0f172a",
+            "button_bg": "#e2e8f0",
+            "button_hover": "#cbd5e1",
+        },
+    }
     PLATFORMS = [
         ("Facebook", "facebook"),
         ("TikTok", "tiktok"),
@@ -111,16 +143,42 @@ class FacebookToolApp:
             ("Messages", "open_messages"),
         ],
     }
+    # Fixed table layout only. This does not define account types and does not limit row count.
+    # Account types and account rows are loaded dynamically and can grow as needed.
+    # Third tuple value is the starting column width in pixels.
+    ACCOUNT_TYPE_COLORS = [
+        ("#d9f99d", "#1f3b08"),
+        ("#bae6fd", "#083344"),
+        ("#ddd6fe", "#2e1065"),
+        ("#fecdd3", "#881337"),
+        ("#fed7aa", "#7c2d12"),
+        ("#bbf7d0", "#052e16"),
+        ("#bfdbfe", "#172554"),
+        ("#fde68a", "#713f12"),
+        ("#fbcfe8", "#831843"),
+        ("#ccfbf1", "#134e4a"),
+        ("#e9d5ff", "#581c87"),
+        ("#c7d2fe", "#312e81"),
+    ]
+    REPORT_PAGE_SIZE = 100
     REPORT_COLUMNS_BY_PLATFORM = {
         "facebook": [
             ("instance", "Firefox", 100),
+            ("local_account", "Local Account", 130),
+            ("country_type", "Country Type", 110),
+            ("account_type", "Account Type", 130),
+            ("expected_country", "Expected Country", 130),
             ("profile", "Account Name", 170),
             ("account_id", "Account ID", 140),
+            ("ip", "IP", 130),
+            ("country", "Current Country", 130),
+            ("status", "Account State", 120),
+            ("reason", "Reason", 230),
+            ("checked", "Checked", 160),
             ("date_birth", "Date Birth", 120),
             ("gender", "Gender", 90),
             ("gmail", "Gmail", 220),
             ("action", "Last Action", 130),
-            ("status", "Status", 120),
             ("runs", "Runs", 70),
             ("done", "Done", 70),
             ("failed", "Failed", 70),
@@ -128,9 +186,18 @@ class FacebookToolApp:
         ],
         "tiktok": [
             ("instance", "Firefox", 100),
+            ("local_account", "Local Account", 130),
+            ("country_type", "Country Type", 110),
+            ("account_type", "Account Type", 130),
+            ("expected_country", "Expected Country", 130),
             ("platform_session", "TikTok Session", 210),
+            ("profile", "Account Name", 170),
+            ("ip", "IP", 130),
+            ("country", "Current Country", 130),
+            ("status", "Account State", 120),
+            ("reason", "Reason", 260),
+            ("checked", "Checked", 160),
             ("action", "TikTok Action", 160),
-            ("status", "Status", 120),
             ("runs", "Runs", 70),
             ("done", "Done", 70),
             ("failed", "Failed", 70),
@@ -138,9 +205,18 @@ class FacebookToolApp:
         ],
         "youtube": [
             ("instance", "Firefox", 100),
+            ("local_account", "Local Account", 130),
+            ("country_type", "Country Type", 110),
+            ("account_type", "Account Type", 130),
+            ("expected_country", "Expected Country", 130),
             ("platform_session", "YouTube Session", 220),
+            ("profile", "Account Name", 170),
+            ("ip", "IP", 130),
+            ("country", "Current Country", 130),
+            ("status", "Account State", 120),
+            ("reason", "Reason", 260),
+            ("checked", "Checked", 160),
             ("action", "YouTube Action", 160),
-            ("status", "Status", 120),
             ("runs", "Runs", 70),
             ("done", "Done", 70),
             ("failed", "Failed", 70),
@@ -148,9 +224,18 @@ class FacebookToolApp:
         ],
         "instagram": [
             ("instance", "Firefox", 100),
+            ("local_account", "Local Account", 130),
+            ("country_type", "Country Type", 110),
+            ("account_type", "Account Type", 130),
+            ("expected_country", "Expected Country", 130),
             ("platform_session", "Instagram Session", 220),
+            ("profile", "Account Name", 170),
+            ("ip", "IP", 130),
+            ("country", "Current Country", 130),
+            ("status", "Account State", 120),
+            ("reason", "Reason", 260),
+            ("checked", "Checked", 160),
             ("action", "Instagram Action", 170),
-            ("status", "Status", 120),
             ("runs", "Runs", 70),
             ("done", "Done", 70),
             ("failed", "Failed", 70),
@@ -183,6 +268,7 @@ class FacebookToolApp:
         self.total_count_label: Label | None = None
         self.live_count_label: Label | None = None
         self.die_count_label: Label | None = None
+        self.no_login_count_label: Label | None = None
         self.processing_count_label: Label | None = None
         self.active_count_label: Label | None = None
         self.deleted_count_label: Label | None = None
@@ -197,6 +283,7 @@ class FacebookToolApp:
         self.monitor_tab_button: Button | None = None
         self.pc_mode_button: Button | None = None
         self.phone_mode_button: Button | None = None
+        self.check_live_buttons: list[Button] = []
         self.workspace_tab: str = "profiles"
         self.report_tree = None
         self.report_column_keys: list[str] = []
@@ -204,6 +291,10 @@ class FacebookToolApp:
         self.platform_tool_windows: dict[str, Toplevel] = {}
         self.platform_tool_trees: dict[str, ttk.Treeview] = {}
         self.platform_tool_status_labels: dict[str, Label] = {}
+        self.platform_tool_stat_labels: dict[str, dict[str, Label]] = {}
+        self.platform_tool_input_refs: dict[str, dict[str, object]] = {}
+        self.platform_tool_country_type_menus: dict[str, ttk.Combobox] = {}
+        self.platform_tool_account_type_menus: dict[str, ttk.Combobox] = {}
         self.backend_status_label: Label | None = None
         self.monitor_profile_count_label: Label | None = None
         self.monitor_live_count_label: Label | None = None
@@ -228,30 +319,46 @@ class FacebookToolApp:
             master=self.root,
             value="disabled, blocked",
         )
-        self.legacy_store_var = tk.StringVar(master=self.root, value="Store")
+        self.legacy_store_var = tk.StringVar(master=self.root, value="All")
         self.legacy_store_name_var = tk.StringVar(master=self.root)
+        self.account_group_var = tk.StringVar(master=self.root, value="All")
+        self.account_group_name_var = tk.StringVar(master=self.root)
         self.legacy_find_var = tk.StringVar(master=self.root)
         self.legacy_add_by_var = tk.StringVar(master=self.root, value="Account")
         self.legacy_status_var = tk.StringVar(master=self.root, value="Ready")
-        self.legacy_stores: list[str] = ["Store"]
+        self.theme_mode_var = tk.StringVar(master=self.root, value="dark")
+        self.legacy_stores: list[str] = ["All"]
+        self.account_groups: list[str] = ["All"]
         self.legacy_store_combo = None
+        self.account_group_combo = None
         self.legacy_account_list = None
+        self.theme_toggle_button: Button | None = None
         self._backend_refresh_after_id: str | None = None
         self._backup_after_id: str | None = None
+        self._open_browser_sync_after_id: str | None = None
+        self._auto_live_check_after_id: str | None = None
+        self.report_page = 1
+        self.report_page_label: Label | None = None
+        self.report_prev_button: Button | None = None
+        self.report_next_button: Button | None = None
 
         self._apply_icon()
-        self._build_layout()
-
         self.browser = BrowserManager(self)
         self.actions = FacebookActions(self)
         self.instances = InstanceManager(self)
 
+        self._build_layout()
         self._build_controls()
         self.instances.initialize_app()
+        self._restore_saved_account_type_lists()
+        self._sync_legacy_account_types_from_reports()
         self._render_action_buttons()
         self.refresh_dashboard()
+        self._apply_runtime_theme()
         self._schedule_backend_refresh()
         self._schedule_auto_backup()
+        self._schedule_open_browser_sync()
+        self._schedule_auto_live_check(initial=True)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def run(self) -> None:
@@ -263,6 +370,10 @@ class FacebookToolApp:
                 self.root.after_cancel(self._backup_after_id)
             if self._backend_refresh_after_id:
                 self.root.after_cancel(self._backend_refresh_after_id)
+            if self._open_browser_sync_after_id:
+                self.root.after_cancel(self._open_browser_sync_after_id)
+            if self._auto_live_check_after_id:
+                self.root.after_cancel(self._auto_live_check_after_id)
             if hasattr(self, "instances"):
                 self.instances.save_instance_data()
         finally:
@@ -319,7 +430,7 @@ class FacebookToolApp:
 
         top_controls = Frame(self.legacy_header, bg=SURFACE_BG)
         top_controls.pack(side=LEFT, fill=X, expand=True, padx=10, pady=8)
-        Label(top_controls, text="New Store", bg=SURFACE_BG, fg=TEXT_MUTED, font=SMALL_FONT).grid(row=0, column=0, sticky="w")
+        Label(top_controls, text="Country Type", bg=SURFACE_BG, fg=TEXT_MUTED, font=SMALL_FONT).grid(row=0, column=0, sticky="w")
         self.legacy_store_combo = ttk.Combobox(
             top_controls,
             textvariable=self.legacy_store_var,
@@ -333,7 +444,8 @@ class FacebookToolApp:
             sticky="ew",
             padx=(0, 8),
         )
-        Label(top_controls, text="Name", bg=SURFACE_BG, fg=TEXT_MUTED, font=SMALL_FONT).grid(row=0, column=1, sticky="w")
+        self.legacy_store_combo.bind("<<ComboboxSelected>>", lambda _event: self._select_account_type())
+        Label(top_controls, text="New Country", bg=SURFACE_BG, fg=TEXT_MUTED, font=SMALL_FONT).grid(row=0, column=1, sticky="w")
         self.style_entry(Entry(top_controls, textvariable=self.legacy_store_name_var), width=20).grid(
             row=1,
             column=1,
@@ -346,6 +458,29 @@ class FacebookToolApp:
             padx=(0, 6),
         )
         self.create_button(top_controls, "Remove", self._remove_legacy_store, kind="neutral", compact=True).grid(row=1, column=3)
+        Label(top_controls, text="Account Type", bg=SURFACE_BG, fg=TEXT_MUTED, font=SMALL_FONT).grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.account_group_combo = ttk.Combobox(
+            top_controls,
+            textvariable=self.account_group_var,
+            values=tuple(self.account_groups),
+            state="readonly",
+            width=18,
+        )
+        self.account_group_combo.grid(row=3, column=0, sticky="ew", padx=(0, 8))
+        self.account_group_combo.bind("<<ComboboxSelected>>", lambda _event: self._select_custom_account_type())
+        Label(top_controls, text="New Account Type", bg=SURFACE_BG, fg=TEXT_MUTED, font=SMALL_FONT).grid(row=2, column=1, sticky="w", pady=(6, 0))
+        self.style_entry(Entry(top_controls, textvariable=self.account_group_name_var), width=20).grid(
+            row=3,
+            column=1,
+            sticky="ew",
+            padx=(0, 8),
+        )
+        self.create_button(top_controls, "Add", self._create_custom_account_type, kind="secondary", compact=True).grid(
+            row=3,
+            column=2,
+            padx=(0, 6),
+        )
+        self.create_button(top_controls, "Remove", self._remove_custom_account_type, kind="neutral", compact=True).grid(row=3, column=3)
         top_controls.grid_columnconfigure(0, weight=1)
         top_controls.grid_columnconfigure(1, weight=1)
 
@@ -360,9 +495,19 @@ class FacebookToolApp:
         )
         self.current_action_label.pack(side=RIGHT, padx=(8, 10), pady=10)
 
+        self.theme_toggle_button = self.create_button(
+            self.legacy_header,
+            "White Theme",
+            self._toggle_theme,
+            "neutral",
+            True,
+        )
+        self.theme_toggle_button.pack(side=RIGHT, padx=(0, 4), pady=10)
+
         stats_wrap = Frame(self.legacy_header, bg=SURFACE_BG)
         stats_wrap.pack(side=RIGHT, pady=8)
         self.total_count_label = self._build_legacy_counter(stats_wrap, "Total", "0", SUCCESS)
+        self.no_login_count_label = self._build_legacy_counter(stats_wrap, "No Login", "0", "#6b7280")
         self.die_count_label = self._build_legacy_counter(stats_wrap, "Die", "0", DANGER)
         self.live_count_label = self._build_legacy_counter(stats_wrap, "Live", "0", ACCENT)
         self.processing_count_label = None
@@ -393,10 +538,14 @@ class FacebookToolApp:
         self.pc_mode_button.pack(side=LEFT, padx=(10, 4))
         self.phone_mode_button = self.create_button(tool_bar, "Phone Mode", lambda: self._set_browser_mode("phone"), "neutral", True)
         self.phone_mode_button.pack(side=LEFT, padx=(0, 10))
-        self.create_button(tool_bar, "Find Acc", lambda: self.refresh_report_table(), "secondary", True).pack(side=LEFT, padx=(0, 4))
+        self.create_button(tool_bar, "Find Acc", self._search_report_table, "secondary", True).pack(side=LEFT, padx=(0, 4))
+        check_live_button = self.create_button(tool_bar, "Check Live", self._run_manual_check_live, "primary", True)
+        check_live_button.pack(side=LEFT, padx=(0, 4))
+        check_live_button._check_live_pack_info = check_live_button.pack_info()
+        self.check_live_buttons.append(check_live_button)
         find_entry = self.style_entry(Entry(tool_bar, textvariable=self.legacy_find_var), width=24)
         find_entry.pack(side=LEFT)
-        find_entry.bind("<Return>", lambda _event: self.refresh_report_table())
+        find_entry.bind("<Return>", lambda _event: self._search_report_table())
         self.create_button(tool_bar, "Save Setting", self.instances_save_if_ready, "success", True).pack(side=RIGHT)
 
         self.workspace_title_label = Label(
@@ -418,6 +567,7 @@ class FacebookToolApp:
         self.table_panel = Frame(self.workspace, bg=SURFACE_ALT)
         self.table_panel.pack(fill=BOTH, expand=True, padx=10, pady=(0, 8))
         self._build_report_table(self.table_panel)
+        self._build_report_pagination(self.workspace)
 
         footer = Frame(self.workspace, bg=SURFACE_BG)
         footer.pack(fill=X, padx=10, pady=(0, 8))
@@ -604,6 +754,16 @@ class FacebookToolApp:
             compact=True,
         )
         self.monitor_tab_button.pack(side=LEFT, padx=(6, 0))
+        check_live_button = self.create_button(
+            toolbar,
+            text="Check Live",
+            command=self._run_manual_check_live,
+            kind="primary",
+            compact=True,
+        )
+        check_live_button.pack(side=LEFT, padx=(6, 0))
+        check_live_button._check_live_pack_info = check_live_button.pack_info()
+        self.check_live_buttons.append(check_live_button)
         self.create_button(
             toolbar,
             text="Reset Table",
@@ -686,17 +846,40 @@ class FacebookToolApp:
         tree_frame.pack(fill=BOTH, expand=True)
 
         columns = tuple(key for key, _title, _width in self._report_columns())
-        self.report_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", style="Report.Treeview")
+        self.report_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", style="Report.Treeview", selectmode="extended")
         self._apply_report_columns()
 
         scroll_y = Scrollbar(tree_frame, orient="vertical", command=self.report_tree.yview)
         scroll_x = Scrollbar(tree_frame, orient="horizontal", command=self.report_tree.xview)
         self.report_tree.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+        self.report_tree.tag_configure("live", background="#04e51f", foreground="#07320f")
+        self.report_tree.tag_configure("review", background="#f59e0b", foreground="#ffffff")
+        self.report_tree.tag_configure("login_required", background="#d1d5db", foreground="#111827")
+        self.report_tree.tag_configure("failed", background="#ff3b1f", foreground="#ffffff")
+        self.report_tree.tag_configure("ip_mismatch", background="#4D1C26", foreground="#ffffff")
+        self.report_tree.tag_configure("working", background="#E5DA05", foreground="#010C03")
+        self.report_tree.tag_configure("select", background="#051BE5", foreground="#ffffff")
+        style.map(
+            "Report.Treeview",
+            background=[("selected", "#051BE5")],
+            foreground=[("selected", "#ffffff")],
+        )
+        scroll_y.pack(side=RIGHT, fill=Y)
+        scroll_x.pack(side="bottom", fill=X)
         self.report_tree.pack(side=LEFT, fill=BOTH, expand=True)
         self.report_tree.bind("<Button-3>", self._show_report_context_menu)
         self.report_tree.bind("<Double-1>", lambda _event: self._open_selected_report_profile())
-        scroll_y.pack(side=RIGHT, fill=Y)
-        scroll_x.pack(side="bottom", fill=X)
+
+    def _build_report_pagination(self, parent: Frame) -> None:
+        pager = Frame(parent, bg=SURFACE_BG)
+        pager.pack(fill=X, padx=10, pady=(0, 8))
+        self.report_prev_button = self.create_button(pager, "Prev Page", lambda: self._change_report_page(-1), "neutral", True)
+        self.report_prev_button.pack(side=LEFT)
+        self.report_page_label = Label(pager, text="Page 1 / 1", bg=SURFACE_BG, fg=TEXT_MUTED, font=SMALL_FONT)
+        self.report_page_label.pack(side=LEFT, padx=10)
+        self.report_next_button = self.create_button(pager, "Next Page", lambda: self._change_report_page(1), "neutral", True)
+        self.report_next_button.pack(side=LEFT)
+        Label(pager, text="100 rows per page", bg=SURFACE_BG, fg=TEXT_MUTED, font=SMALL_FONT).pack(side=LEFT, padx=12)
 
     def _build_backend_monitor(self, parent: Frame) -> None:
         shell = Frame(parent, bg=SURFACE_ALT)
@@ -803,7 +986,7 @@ class FacebookToolApp:
         }
         for column, (title, width) in headings.items():
             self.monitor_tree.heading(column, text=title)
-            self.monitor_tree.column(column, width=width, anchor="w")
+            self.monitor_tree.column(column, width=width, anchor="w", stretch=False)
 
         self.monitor_tree.tag_configure("live", background="#e7f8ee", foreground="#0f5f35")
         self.monitor_tree.tag_configure("review", background="#fff4da", foreground="#8b5a00")
@@ -813,9 +996,9 @@ class FacebookToolApp:
         scroll_y = Scrollbar(tree_frame, orient="vertical", command=self.monitor_tree.yview)
         scroll_x = Scrollbar(tree_frame, orient="horizontal", command=self.monitor_tree.xview)
         self.monitor_tree.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
-        self.monitor_tree.pack(side=LEFT, fill=BOTH, expand=True)
         scroll_y.pack(side=RIGHT, fill=Y)
         scroll_x.pack(side="bottom", fill=X)
+        self.monitor_tree.pack(side=LEFT, fill=BOTH, expand=True)
 
     def switch_workspace_tab(self, tab_name: str) -> None:
         self.workspace_tab = tab_name
@@ -885,9 +1068,15 @@ class FacebookToolApp:
         columns = self._report_columns()
         self.report_column_keys = [key for key, _title, _width in columns]
         self.report_tree.configure(columns=self.report_column_keys)
-        for key, title, width in columns:
+        for key, title, default_width in columns:
             self.report_tree.heading(key, text=title)
-            self.report_tree.column(key, width=width, anchor="w")
+            self.report_tree.column(
+                key,
+                width=default_width,
+                minwidth=max(60, min(default_width, 100)),
+                anchor="w",
+                stretch=True,
+            )
 
     def _report_value(self, row: dict, key: str) -> str:
         if key == "platform_session":
@@ -918,14 +1107,137 @@ class FacebookToolApp:
         for item in self.report_tree.get_children():
             self.report_tree.delete(item)
         query = self.legacy_find_var.get().strip().lower() if hasattr(self, "legacy_find_var") else ""
+        country_type = self._selected_account_type()
+        custom_type = self._selected_custom_account_type()
+        filtered_rows = []
         for row in self.instances.get_report_rows():
+            if country_type and not self.instances.report_matches_account_type(row, country_type):
+                continue
             values_by_key = {key: self._report_value(row, key) for key in self.report_column_keys}
+            if custom_type and str(row.get("account_type") or "").strip().lower() != custom_type.lower():
+                continue
             if query and query not in " ".join(values_by_key.values()).lower():
                 continue
+            filtered_rows.append((row, values_by_key))
+
+        total_rows = len(filtered_rows)
+        total_pages = max(1, math.ceil(total_rows / self.REPORT_PAGE_SIZE))
+        self.report_page = max(1, min(self.report_page, total_pages))
+        start = (self.report_page - 1) * self.REPORT_PAGE_SIZE
+        end = start + self.REPORT_PAGE_SIZE
+        for row, values_by_key in filtered_rows[start:end]:
             values = tuple(values_by_key[key] for key in self.report_column_keys)
-            self.report_tree.insert("", "end", values=values)
+            instance_id = str(row.get("instance_id") or "")
+            try:
+                if instance_id:
+                    self.report_tree.insert(
+                        "",
+                        "end",
+                        iid=instance_id,
+                        values=values,
+                        tags=self._report_row_tags(row, self.report_tree),
+                    )
+                else:
+                    self.report_tree.insert("", "end", values=values, tags=self._report_row_tags(row, self.report_tree))
+            except tk.TclError:
+                self.report_tree.insert("", "end", values=values, tags=self._report_row_tags(row, self.report_tree))
+        self._refresh_report_pagination(total_rows, total_pages)
         if hasattr(self, "_refresh_legacy_account_list"):
             self._refresh_legacy_account_list()
+
+    def _search_report_table(self) -> None:
+        self.report_page = 1
+        self.refresh_report_table()
+
+    def _refresh_report_pagination(self, total_rows: int, total_pages: int) -> None:
+        if self.report_page_label:
+            self.report_page_label.config(text=f"Page {self.report_page} / {total_pages} ({total_rows} rows)")
+        if self.report_prev_button:
+            self.report_prev_button.config(state="normal" if self.report_page > 1 else "disabled")
+        if self.report_next_button:
+            self.report_next_button.config(state="normal" if self.report_page < total_pages else "disabled")
+
+    def _change_report_page(self, delta: int) -> None:
+        self.report_page = max(1, self.report_page + delta)
+        self.refresh_report_table()
+
+    def _schedule_open_browser_sync(self) -> None:
+        self._open_browser_sync_after_id = None
+
+    def _open_browser_sync_tick(self) -> None:
+        return
+
+    def _schedule_auto_live_check(self, initial: bool = False) -> None:
+        if self._auto_live_check_after_id:
+            try:
+                self.root.after_cancel(self._auto_live_check_after_id)
+            except Exception:
+                pass
+            self._auto_live_check_after_id = None
+        return
+
+    def _auto_live_check_tick(self) -> None:
+        return
+
+    def _run_manual_check_live(self) -> None:
+        if not hasattr(self, "instances"):
+            return
+        account_type = self._selected_account_type()
+        if not account_type:
+            self._set_legacy_status("Select one account type before Check Live")
+            self.messagebox.showwarning("Check Live", "Select one account type first. Check Live is disabled for All.")
+            return
+        self.instances.check_live_all_instances(show_empty_warning=True, account_type=account_type)
+
+    def _report_status_tag(self, row: dict) -> str:
+        status = str(row.get("status", "")).strip().lower()
+        reason = str(row.get("reason", "")).strip().lower()
+        login_text = f"{status} {reason}"
+        if any(marker in status for marker in ("live", "success", "ready", "done")):
+            return "live"
+        if "ip mismatch" in status:
+            return "ip_mismatch"
+        if any(marker in status for marker in ("checkpoint", "challenge", "verify", "review")):
+            return "review"
+        if any(
+            marker in login_text
+            for marker in (
+                "login required",
+                "login request",
+                "login cookie was not found",
+                "session cookie was not found",
+                "no saved cookies",
+                "no cookie",
+            )
+        ):
+            return "login_required"
+        if any(marker in status for marker in ("disabled", "suspended", "locked", "failed", "die", "dead", "error")):
+            return "failed"
+        if any(marker in status for marker in ("checking", "queued", "running", "launch")):
+            return "working"
+        return ""
+
+    def _report_row_tags(self, row: dict, tree: ttk.Treeview | None = None) -> tuple[str, ...]:
+        status_tag = self._report_status_tag(row)
+        if status_tag:
+            return (status_tag,)
+        account_type = str(row.get("country_type") or row.get("account_type") or "").strip()
+        if not account_type or account_type == "-":
+            return ()
+        return (self._account_type_tag(account_type, tree or self.report_tree),)
+
+    def _account_type_tag(self, account_type: str, tree: ttk.Treeview | None = None) -> str:
+        clean = str(account_type or "").strip()
+        tag = "type_" + "".join(ch.lower() if ch.isalnum() else "_" for ch in clean)[:40]
+        score = sum((index + 1) * ord(ch) for index, ch in enumerate(clean.lower()))
+        bg, fg = self.ACCOUNT_TYPE_COLORS[score % len(self.ACCOUNT_TYPE_COLORS)]
+        target_tree = tree or self.report_tree
+        if target_tree:
+            try:
+                target_tree.tag_configure(tag, background=bg, foreground=fg)
+            except Exception:
+                pass
+        return tag
 
     def _show_report_context_menu(self, event) -> None:
         if not self.report_tree:
@@ -933,13 +1245,23 @@ class FacebookToolApp:
         row_id = self.report_tree.identify_row(event.y)
         if not row_id:
             return
-        self.report_tree.selection_set(row_id)
+        if row_id not in self.report_tree.selection():
+            self.report_tree.selection_set(row_id)
         menu = tk.Menu(self.root, tearoff=False)
         menu.add_command(label="Open Browser Profile", command=self._open_selected_report_profile)
         if self.vars.platform_var.get() == "facebook":
             menu.add_command(label="Copy UID", command=self._copy_selected_report_uid)
         menu.add_command(label="Copy Row", command=self._copy_selected_report_row)
         menu.add_separator()
+        selected_type = self._selected_account_type()
+        if selected_type:
+            menu.add_command(label=f"Set Country Type: {selected_type}", command=self._assign_selected_report_type)
+        custom_type = self._selected_custom_account_type()
+        if custom_type:
+            menu.add_command(label=f"Set Account Type: {custom_type}", command=self._assign_selected_custom_account_type)
+        menu.add_command(label="Set Account Type...", command=self._prompt_assign_selected_custom_account_type)
+        if selected_type or custom_type:
+            menu.add_separator()
         menu.add_command(label="Mark Live", command=lambda: self._mark_selected_report_status("Live"))
         menu.add_command(label="Mark Die", command=lambda: self._mark_selected_report_status("Die"))
         menu.add_command(label="Mark Processing", command=lambda: self._mark_selected_report_status("Processing"))
@@ -958,23 +1280,79 @@ class FacebookToolApp:
         return tuple(str(value) for value in values)
 
     def _selected_report_instance_number(self) -> int | None:
-        values = self._selected_report_values()
-        if not values:
+        if not self.report_tree:
             return None
-        label = values[0].strip()
-        return self._instance_number_from_label(label)
+        selection = self.report_tree.selection()
+        if not selection:
+            return None
+        try:
+            return int(str(selection[0]))
+        except Exception:
+            values = self._selected_report_values()
+            if not values:
+                return None
+            return self._instance_number_from_label(values[0].strip())
+
+    def _selected_report_instance_numbers(self) -> list[int]:
+        if not self.report_tree:
+            return []
+        numbers: list[int] = []
+        for item in self.report_tree.selection():
+            try:
+                number = int(str(item))
+            except Exception:
+                values = self.report_tree.item(item, "values")
+                if not values:
+                    continue
+                number = self._instance_number_from_label(str(values[0]))
+            if number is not None:
+                numbers.append(number)
+        return numbers
 
     def _open_selected_report_profile(self) -> None:
         instance_number = self._selected_report_instance_number()
         if not instance_number:
             return
-        threading.Thread(target=self.instances.run_firefox_instance, args=(instance_number,), daemon=True).start()
+        platform = self.vars.platform_var.get()
+        start_url = self._profile_open_url(instance_number, platform)
+        threading.Thread(
+            target=self._open_selected_report_profile_worker,
+            args=(instance_number, platform, start_url),
+            daemon=True,
+        ).start()
+
+    def _open_selected_report_profile_worker(self, instance_number: int, platform: str, start_url: str) -> None:
+        self.browser.open_firefox_instance(
+            instance_number=instance_number,
+            login=False,
+            start_url=start_url,
+            sync_preview=False,
+        )
+
+    def _sync_open_profile_identity_when_ready(self, instance_number: int, driver) -> None:
+        return
+
+    def _profile_open_url(self, instance_number: int, platform: str) -> str:
+        report = self.state.instance_reports.get(instance_number, {})
+        account_id = str(report.get("account_id", "") or "").strip()
+        if platform == "facebook" and account_id.isdigit():
+            return f"https://www.facebook.com/profile.php?id={account_id}&sk=directory_personal_details"
+        if platform == "tiktok":
+            return "https://www.tiktok.com"
+        if platform == "youtube":
+            return "https://www.youtube.com"
+        if platform == "instagram":
+            return "https://www.instagram.com"
+        return "https://www.facebook.com"
 
     def _copy_selected_report_uid(self) -> None:
         values = self._selected_report_values()
-        if not values or len(values) < 3:
+        if not values or "account_id" not in self.report_column_keys:
             return
-        uid = "" if values[2] == "-" else values[2]
+        index = self.report_column_keys.index("account_id")
+        if index >= len(values):
+            return
+        uid = "" if values[index] == "-" else values[index]
         self.root.clipboard_clear()
         self.root.clipboard_append(uid)
 
@@ -1121,16 +1499,13 @@ class FacebookToolApp:
                 full_width=True,
             )
             button.pack(fill=X, pady=1)
+            button.bind("<Double-Button-1>", lambda _event, value=value: self._open_platform_tool_popup(value), add="+")
             self.platform_buttons[value] = button
-
-        self.action_section = self._create_sidebar_section(
-            "Function",
-            description="Select a mode, then click a profile card to run.",
-        )
-        self._render_action_buttons()
 
         self._refresh_action_buttons()
         self._refresh_platform_buttons()
+        if hasattr(self, "theme_mode_var"):
+            self._apply_runtime_theme()
 
     def _build_legacy_controls(self) -> None:
         for child in self.sidebar.winfo_children():
@@ -1232,9 +1607,6 @@ class FacebookToolApp:
             target="platform",
         )
 
-        self.action_section = self._create_legacy_section("Tool Menu")
-        self._render_action_buttons()
-
         bottom = Frame(self.sidebar, bg=SURFACE_BG)
         bottom.pack(fill=X, side="bottom", padx=10, pady=10)
         self.create_button(bottom, "Key Pro", self._show_key_pro_status, "neutral", True).pack(
@@ -1267,41 +1639,281 @@ class FacebookToolApp:
             button = self.create_button(section, label, command, kind=kind, compact=True, full_width=True)
             button.pack(fill=X, pady=1)
             if target == "platform":
+                button.bind("<Double-Button-1>", lambda _event, value=value: self._open_platform_tool_popup(value), add="+")
                 self.platform_buttons[value] = button
 
     def _set_legacy_status(self, text: str) -> None:
         if hasattr(self, "legacy_status_var"):
             self.legacy_status_var.set(text)
 
+    def _selected_account_type(self) -> str:
+        if not hasattr(self, "legacy_store_var"):
+            return ""
+        value = self.legacy_store_var.get().strip()
+        if value.lower() in {"", "all", "store"}:
+            return ""
+        return value
+
+    def _selected_custom_account_type(self) -> str:
+        if not hasattr(self, "account_group_var"):
+            return ""
+        value = self.account_group_var.get().strip()
+        if value.lower() in {"", "all", "store"}:
+            return ""
+        return value
+
+    def _sync_legacy_account_types_from_reports(self) -> None:
+        values = {"All"}
+        created = {value for value in getattr(self, "legacy_stores", ["All"]) if value and value != "All"}
+        if hasattr(self, "instances"):
+            for row in self.instances.get_report_rows():
+                country_type = str(row.get("country_type", "") or row.get("account_type", "") or "").strip()
+                if country_type and country_type != "-":
+                    values.add(country_type)
+                    continue
+                country = str(row.get("country", "") or "").strip()
+                if country and country != "-":
+                    values.add(country)
+        current = self.legacy_store_var.get().strip() or "All"
+        self.legacy_stores = ["All"] + sorted((values | created) - {"All"})
+        if current in self.legacy_stores:
+            self.legacy_store_var.set(current)
+        else:
+            self.legacy_store_var.set("All")
+        self._refresh_legacy_store_combo()
+        self._sync_custom_account_types_from_reports()
+        self._refresh_check_live_buttons()
+
+    def _restore_saved_account_type_lists(self) -> None:
+        country_types = {
+            str(value).strip()
+            for value in getattr(self.instances, "saved_country_types", [])
+            if str(value or "").strip()
+        }
+        custom_types = {
+            str(value).strip()
+            for value in getattr(self.instances, "saved_custom_account_types", [])
+            if str(value or "").strip()
+        }
+        if country_types:
+            self.legacy_stores = ["All"] + sorted(country_types - {"All"})
+            if self.legacy_store_var.get() not in self.legacy_stores:
+                self.legacy_store_var.set("All")
+        if custom_types:
+            self.account_groups = ["All"] + sorted(custom_types - {"All"})
+            if self.account_group_var.get() not in self.account_groups:
+                self.account_group_var.set("All")
+
+    def _sync_custom_account_types_from_reports(self) -> None:
+        values = {"All"}
+        if hasattr(self, "instances"):
+            for row in self.instances.get_report_rows():
+                value = str(row.get("account_type", "") or "").strip()
+                if value and value != "-":
+                    values.add(value)
+        current = self.account_group_var.get().strip() or "All"
+        created = {value for value in getattr(self, "account_groups", ["All"]) if value and value != "All"}
+        self.account_groups = ["All"] + sorted((values | created) - {"All"})
+        if current in self.account_groups:
+            self.account_group_var.set(current)
+        else:
+            self.account_group_var.set("All")
+        self._refresh_account_group_combo()
+
+    def _select_account_type(self) -> None:
+        selected = self._selected_account_type()
+        self.report_page = 1
+        self._set_legacy_status(f"Country type: {selected or 'All'}")
+        self._refresh_check_live_buttons()
+        self.refresh_report_table()
+        self._refresh_legacy_account_list()
+        self.refresh_dashboard()
+        for platform in list(self.platform_tool_trees):
+            self._refresh_platform_tool_accounts(platform)
+        if hasattr(self, "_schedule_auto_live_check"):
+            self._schedule_auto_live_check(initial=True)
+
+    def _select_custom_account_type(self) -> None:
+        selected = self._selected_custom_account_type()
+        self.report_page = 1
+        self._set_legacy_status(f"Account type: {selected or 'All'}")
+        self.refresh_report_table()
+        self._refresh_legacy_account_list()
+        self.refresh_dashboard()
+        for platform in list(self.platform_tool_trees):
+            self._refresh_platform_tool_accounts(platform)
+
+    def _refresh_check_live_buttons(self) -> None:
+        enabled = bool(self._selected_account_type())
+        for button in getattr(self, "check_live_buttons", []):
+            try:
+                if enabled:
+                    button.config(state="normal", cursor="hand2")
+                    if not button.winfo_manager():
+                        button.pack(**getattr(button, "_check_live_pack_info", {"side": LEFT}))
+                else:
+                    if button.winfo_manager():
+                        button.pack_forget()
+            except Exception:
+                continue
+
+    def _assign_selected_report_type(self) -> None:
+        instance_numbers = self._selected_report_instance_numbers()
+        account_type = self._selected_account_type()
+        if not instance_numbers:
+            self._set_legacy_status("Select account rows first")
+            return
+        if not account_type:
+            self._set_legacy_status("Select an account type first")
+            return
+        for instance_number in instance_numbers:
+            self.instances.set_account_type(instance_number, account_type, save_data=False, refresh_table=False)
+        self.instances.save_instance_data()
+        self.instances.sync_local_profiles_to_backend_async(instance_numbers)
+        self._sync_legacy_account_types_from_reports()
+        self.refresh_report_table()
+        self._set_legacy_status(f"{len(instance_numbers)} account(s) country: {account_type}")
+
+    def _assign_selected_custom_account_type(self) -> None:
+        account_type = self._selected_custom_account_type()
+        if not account_type:
+            self._set_legacy_status("Select an account type first")
+            return
+        self._assign_custom_account_type_to_selection(account_type)
+
+    def _prompt_assign_selected_custom_account_type(self) -> None:
+        available_types = [
+            str(value).strip()
+            for value in self.account_groups
+            if str(value or "").strip() and str(value).strip().lower() != "all"
+        ]
+        if not available_types:
+            self._set_legacy_status("Add an account type first")
+            return
+
+        selected_var = tk.StringVar(master=self.root, value=available_types[0])
+        type_window = self.create_modal("Set Account Type", "460x340")
+        type_window.minsize(460, 320)
+        body = self.create_modal_card(type_window, "Set Account Type", "Choose an existing account type.")
+        Label(body, text="Account Type", bg=SURFACE_BG, fg=TEXT_MUTED, font=SMALL_FONT).pack(anchor="w")
+        type_menu = ttk.Combobox(
+            body,
+            textvariable=selected_var,
+            values=tuple(available_types),
+            state="readonly",
+            width=28,
+        )
+        type_menu.pack(fill=X, pady=(8, 22), ipady=3)
+        type_menu.current(0)
+        type_menu.focus_set()
+
+        footer = Frame(body, bg=SURFACE_BG)
+        footer.pack(fill=X, pady=(4, 0))
+
+        def apply_type() -> None:
+            account_type = selected_var.get().strip()
+            if account_type:
+                self._assign_custom_account_type_to_selection(account_type)
+            type_window.destroy()
+
+        self.create_button(footer, "Apply", apply_type, kind="primary", compact=True).pack(side=LEFT)
+        self.create_button(footer, "Close", type_window.destroy, kind="neutral", compact=True).pack(side=LEFT, padx=(8, 0))
+        type_window.bind("<Return>", lambda _event: apply_type())
+
+    def _assign_custom_account_type_to_selection(self, account_type: str) -> None:
+        instance_numbers = self._selected_report_instance_numbers()
+        clean_type = str(account_type or "").strip()
+        if not instance_numbers:
+            self._set_legacy_status("Select account rows first")
+            return
+        if not clean_type or clean_type.lower() in {"all", "store"}:
+            self._set_legacy_status("Account type name required")
+            return
+        for instance_number in instance_numbers:
+            self.instances.set_custom_account_type(instance_number, clean_type, save_data=False, refresh_table=False)
+        self.instances.save_instance_data()
+        self.instances.sync_local_profiles_to_backend_async(instance_numbers)
+        if clean_type not in self.account_groups:
+            self.account_groups.append(clean_type)
+        self.account_group_var.set(clean_type)
+        self._sync_custom_account_types_from_reports()
+        self.report_page = 1
+        self.refresh_report_table()
+        self._set_legacy_status(f"{len(instance_numbers)} account(s) type: {clean_type}")
+
     def _create_legacy_store(self) -> None:
         name = self.legacy_store_name_var.get().strip()
         if not name:
-            self._set_legacy_status("Store name required")
+            self._set_legacy_status("Country type name required")
             return
         if name not in self.legacy_stores:
             self.legacy_stores.append(name)
         self.legacy_store_var.set(name)
         self.legacy_store_name_var.set("")
         self._refresh_legacy_store_combo()
+        self._select_account_type()
         self.instances.save_instance_data()
-        self._set_legacy_status(f"Store created: {name}")
+        self._set_legacy_status(f"Country type created: {name}")
 
     def _remove_legacy_store(self) -> None:
         name = self.legacy_store_var.get().strip()
-        if not name or name == "Store":
-            self._set_legacy_status("Select a custom store")
+        if not name or name == "All":
+            self._set_legacy_status("Select a country type")
             return
         self.legacy_stores = [store for store in self.legacy_stores if store != name]
-        if "Store" not in self.legacy_stores:
-            self.legacy_stores.insert(0, "Store")
+        if "All" not in self.legacy_stores:
+            self.legacy_stores.insert(0, "All")
         self.legacy_store_var.set(self.legacy_stores[0])
         self._refresh_legacy_store_combo()
+        self._select_account_type()
         self.instances.save_instance_data()
-        self._set_legacy_status(f"Store removed: {name}")
+        self._set_legacy_status(f"Country type removed: {name}")
+
+    def _create_custom_account_type(self) -> None:
+        name = self.account_group_name_var.get().strip()
+        if not name:
+            self._set_legacy_status("Account type name required")
+            return
+        if name not in self.account_groups:
+            self.account_groups.append(name)
+        self.account_group_var.set(name)
+        self.account_group_name_var.set("")
+        self._refresh_account_group_combo()
+        self._select_custom_account_type()
+        self.instances.save_instance_data()
+        self._set_legacy_status(f"Account type created: {name}")
+
+    def _remove_custom_account_type(self) -> None:
+        name = self.account_group_var.get().strip()
+        if not name or name == "All":
+            self._set_legacy_status("Select an account type")
+            return
+        self.account_groups = [group for group in self.account_groups if group != name]
+        if "All" not in self.account_groups:
+            self.account_groups.insert(0, "All")
+        self.account_group_var.set(self.account_groups[0])
+        self._refresh_account_group_combo()
+        self._select_custom_account_type()
+        self.instances.save_instance_data()
+        self._set_legacy_status(f"Account type removed: {name}")
 
     def _refresh_legacy_store_combo(self) -> None:
         if self.legacy_store_combo:
             self.legacy_store_combo.configure(values=tuple(self.legacy_stores))
+        for combo in list(getattr(self, "platform_tool_country_type_menus", {}).values()):
+            try:
+                combo.configure(values=tuple(self.legacy_stores))
+            except Exception:
+                continue
+
+    def _refresh_account_group_combo(self) -> None:
+        if self.account_group_combo:
+            self.account_group_combo.configure(values=tuple(self.account_groups))
+        for combo in list(getattr(self, "platform_tool_account_type_menus", {}).values()):
+            try:
+                combo.configure(values=tuple(self.account_groups))
+            except Exception:
+                continue
 
     def _refresh_legacy_account_list(self) -> None:
         account_list = getattr(self, "legacy_account_list", None)
@@ -1309,11 +1921,25 @@ class FacebookToolApp:
             return
         account_list.delete(0, tk.END)
         query = self.legacy_find_var.get().strip().lower() if hasattr(self, "legacy_find_var") else ""
+        country_type = self._selected_account_type()
+        custom_type = self._selected_custom_account_type()
         for instance_number in self.instances.active_instance_numbers():
+            if country_type and not self.instances.instance_matches_account_type(instance_number, country_type):
+                continue
+            report = self.state.instance_reports.get(instance_number, {})
+            if custom_type and str(report.get("custom_account_type") or "").strip().lower() != custom_type.lower():
+                continue
             name = self.state.instance_names.get(instance_number) or self.state.profile_names.get(instance_number)
-            label = f"Firefox {instance_number}"
+            local_label = self.instances._local_account_label(instance_number, report)
+            label = f"{local_label} | Firefox {instance_number}"
             if name:
                 label = f"{label} | {name}"
+            row_type = str(report.get("account_type") or report.get("country") or "").strip()
+            if row_type and row_type not in label:
+                label = f"{label} | {row_type}"
+            custom_row_type = str(report.get("custom_account_type") or "").strip()
+            if custom_row_type:
+                label = f"{label} | {custom_row_type}"
             if query and query not in label.lower():
                 continue
             account_list.insert(tk.END, label)
@@ -1417,6 +2043,7 @@ class FacebookToolApp:
         )
         style.update(overrides)
         button = Button(parent, **style)
+        button._theme_kind = kind
         self._attach_button_hover(button)
         return button
 
@@ -1441,15 +2068,159 @@ class FacebookToolApp:
         button.bind("<Enter>", on_enter, add="+")
         button.bind("<Leave>", on_leave, add="+")
 
+    def _theme_palette(self) -> dict[str, str]:
+        mode = self.theme_mode_var.get() if hasattr(self, "theme_mode_var") else "dark"
+        return self.THEME_PALETTES.get(mode, self.THEME_PALETTES["dark"])
+
+    def _toggle_theme(self) -> None:
+        next_mode = "light" if self.theme_mode_var.get() == "dark" else "dark"
+        self.theme_mode_var.set(next_mode)
+        self._apply_runtime_theme()
+
+    def _apply_runtime_theme(self, root_widget=None) -> None:
+        palette = self._theme_palette()
+        root_widget = root_widget or self.root
+        if root_widget == self.root:
+            self.root.configure(bg=palette["app"])
+        self._configure_ttk_theme()
+        self._theme_widget_tree(root_widget, palette)
+        if self.theme_toggle_button:
+            self.theme_toggle_button.config(text="Dark Theme" if self.theme_mode_var.get() == "light" else "White Theme")
+
+    def _configure_ttk_theme(self) -> None:
+        palette = self._theme_palette()
+        style = ttk.Style(self.root)
+        style.configure(
+            "Report.Treeview",
+            background=palette["surface"],
+            fieldbackground=palette["surface"],
+            foreground=palette["text"],
+            bordercolor=palette["border"],
+            rowheight=24,
+            relief="flat",
+        )
+        style.configure(
+            "Report.Treeview.Heading",
+            background=palette["button_bg"],
+            foreground=palette["text"],
+            bordercolor=palette["border"],
+            relief="flat",
+            font=SECTION_FONT,
+        )
+        style.map(
+            "Report.Treeview",
+            background=[("selected", "#05CBE5")],
+            foreground=[("selected", "#010C03")],
+        )
+        style.configure(
+            "TCombobox",
+            fieldbackground=palette["input_bg"],
+            background=palette["input_bg"],
+            foreground=palette["input_fg"],
+            arrowcolor=palette["text"],
+        )
+
+    def _theme_widget_tree(self, widget, palette: dict[str, str]) -> None:
+        self._theme_single_widget(widget, palette)
+        for child in widget.winfo_children():
+            self._theme_widget_tree(child, palette)
+
+    def _theme_single_widget(self, widget, palette: dict[str, str]) -> None:
+        colored_backgrounds = {ACCENT, SUCCESS, DANGER}
+        try:
+            widget_class = widget.winfo_class()
+        except Exception:
+            return
+
+        if widget_class in {"Frame", "Toplevel"}:
+            bg = palette["app"] if widget in {self.root, getattr(self, "main_frame", None)} else palette["surface"]
+            if widget in {getattr(self, "table_panel", None), getattr(self, "profiles_panel", None), getattr(self, "monitor_panel", None)}:
+                bg = palette["alt"]
+            widget.configure(bg=bg, highlightbackground=palette["border"])
+            return
+
+        if widget_class == "Canvas":
+            widget.configure(bg=palette["alt"], highlightbackground=palette["border"])
+            return
+
+        if widget_class == "Label":
+            try:
+                current_bg = str(widget.cget("bg"))
+            except Exception:
+                current_bg = ""
+            if current_bg in colored_backgrounds:
+                widget.configure(fg=TEXT_ON_DARK)
+                return
+            parent_bg = palette["surface"]
+            try:
+                parent_bg = widget.master.cget("bg")
+            except Exception:
+                pass
+            fg = palette["muted"] if str(widget.cget("fg")) in {TEXT_MUTED, TEXT_SUBTLE, palette["muted"], palette["subtle"]} else palette["text"]
+            widget.configure(bg=parent_bg, fg=fg, highlightbackground=palette["border"])
+            return
+
+        if widget_class == "Button":
+            self._theme_button(widget, palette)
+            return
+
+        if widget_class == "Entry":
+            widget.configure(
+                bg=palette["input_bg"],
+                fg=palette["input_fg"],
+                insertbackground=palette["input_fg"],
+                highlightbackground=palette["border"],
+            )
+            return
+
+        if widget_class == "Listbox":
+            widget.configure(
+                bg=palette["input_bg"],
+                fg=palette["input_fg"],
+                selectbackground=ACCENT,
+                selectforeground=TEXT_ON_DARK,
+                highlightbackground=palette["border"],
+            )
+            return
+
+        if widget_class == "Text":
+            widget.configure(
+                bg=palette["input_bg"],
+                fg=palette["input_fg"],
+                insertbackground=palette["input_fg"],
+                highlightbackground=palette["border"],
+            )
+
+    def _theme_button(self, button: Button, palette: dict[str, str]) -> None:
+        kind = getattr(button, "_theme_kind", "secondary")
+        if kind == "primary":
+            bg, fg, hover = ACCENT, TEXT_ON_DARK, ACCENT_HOVER
+        elif kind == "success":
+            bg, fg, hover = SUCCESS, TEXT_ON_DARK, "#58791c"
+        elif kind == "danger":
+            bg, fg, hover = DANGER, TEXT_ON_DARK, "#d93f1a"
+        elif kind == "warning":
+            bg, fg, hover = "#e0a51b", TEXT_ON_DARK, "#bd8a15"
+        else:
+            bg, fg, hover = palette["button_bg"], palette["text"], palette["button_hover"]
+        button.configure(
+            bg=bg,
+            fg=fg,
+            activebackground=hover,
+            activeforeground=fg,
+            highlightbackground=palette["border"],
+        )
+
     def style_entry(self, entry: Entry, width: int | None = None) -> Entry:
+        palette = self._theme_palette()
         entry.configure(
             relief="flat",
             bd=0,
-            bg=INPUT_BG,
-            fg=TEXT_PRIMARY,
-            insertbackground=TEXT_PRIMARY,
+            bg=palette["input_bg"],
+            fg=palette["input_fg"],
+            insertbackground=palette["input_fg"],
             highlightthickness=1,
-            highlightbackground=BORDER,
+            highlightbackground=palette["border"],
             highlightcolor=ACCENT,
             font=BODY_FONT,
         )
@@ -1467,6 +2238,7 @@ class FacebookToolApp:
         window.focus_set()
         if modal:
             window.grab_set()
+        window.after(20, lambda window=window: self._apply_runtime_theme(window))
         return window
 
     def _center_modal(self, window: Toplevel, geometry: str) -> None:
@@ -1493,19 +2265,61 @@ class FacebookToolApp:
         return body
 
     def refresh_dashboard(self) -> None:
-        active_count = sum(1 for _button, frame in self.state.firefox_buttons if frame is not None)
+        selected_type = self._selected_account_type() if hasattr(self, "_selected_account_type") else ""
+        selected_custom_type = self._selected_custom_account_type() if hasattr(self, "_selected_custom_account_type") else ""
+        if selected_type and hasattr(self, "instances"):
+            active_count = len(self.instances.active_instance_numbers_for_type(selected_type))
+        else:
+            active_count = sum(1 for _button, frame in self.state.firefox_buttons if frame is not None)
         deleted_count = len(self.state.deleted_instances)
         action_value = self.vars.action_var.get().replace("_", " ").title()
         report_rows = self.instances.get_report_rows() if hasattr(self, "instances") else []
+        if selected_type and hasattr(self, "instances"):
+            report_rows = [row for row in report_rows if self.instances.report_matches_account_type(row, selected_type)]
+        if selected_custom_type:
+            report_rows = [
+                row
+                for row in report_rows
+                if str(row.get("account_type") or "").strip().lower() == selected_custom_type.lower()
+            ]
+            active_count = len(report_rows)
         total_count = len(report_rows)
         live_count = 0
         die_count = 0
+        no_login_count = 0
         processing_count = 0
         for row in report_rows:
             status = str(row.get("status", "")).strip().lower()
+            reason = str(row.get("reason", "")).strip().lower()
+            status_reason = f"{status} {reason}"
             if status in {"done", "ready", "success", "cache cleared", "live"} or "running" in status:
                 live_count += 1
-            elif "fail" in status or "error" in status or "die" in status or "dead" in status or "disabled" in status:
+            elif any(
+                marker in status_reason
+                for marker in (
+                    "login required",
+                    "login request",
+                    "login cookie was not found",
+                    "session cookie was not found",
+                    "no saved cookies",
+                    "no cookie",
+                    "returned a login page",
+                    "logged out",
+                    "not logged in",
+                    "not signed in",
+                )
+            ):
+                no_login_count += 1
+            elif (
+                "checkpoint" in status
+                or "challenge" in status
+                or "verify" in status
+                or "disabled" in status
+                or "suspended" in status
+                or "locked" in status
+                or "die" in status
+                or "dead" in status
+            ):
                 die_count += 1
             elif any(marker in status for marker in ("queue", "launch", "wait", "process")):
                 processing_count += 1
@@ -1516,6 +2330,8 @@ class FacebookToolApp:
             self.live_count_label.config(text=str(live_count))
         if self.die_count_label:
             self.die_count_label.config(text=str(die_count))
+        if getattr(self, "no_login_count_label", None):
+            self.no_login_count_label.config(text=str(no_login_count))
         if self.processing_count_label:
             self.processing_count_label.config(text=str(processing_count))
         if self.active_count_label:
@@ -1547,12 +2363,26 @@ class FacebookToolApp:
     def _select_platform(self, value: str) -> None:
         known_values = {platform_value for _label, platform_value in self.PLATFORMS}
         clean_value = value if value in known_values else "facebook"
-        self.vars.platform_var.set(clean_value)
+        if hasattr(self, "instances"):
+            self.instances.switch_platform(clean_value)
+        else:
+            self.vars.platform_var.set(clean_value)
+        valid_actions = self.ACTIONS_BY_PLATFORM.get(clean_value, self.ACTIONS_BY_PLATFORM["facebook"])
+        valid_action_values = {action_value for _label, action_value in valid_actions}
+        if self.vars.action_var.get() not in valid_action_values:
+            self.vars.action_var.set(valid_actions[0][1])
         self._render_action_buttons()
+        self._sync_legacy_account_types_from_reports()
         if hasattr(self, "instances"):
             self.instances.refresh_platform_cards()
-            self.instances.save_instance_data()
         self.refresh_dashboard()
+        if hasattr(self, "_schedule_auto_live_check"):
+            self._schedule_auto_live_check(initial=True)
+
+    def _open_platform_tool_popup(self, value: str | None = None) -> None:
+        if value:
+            self._select_platform(value)
+        self._open_platform_publish_window()
 
     def _refresh_platform_buttons(self) -> None:
         current = self.vars.platform_var.get()
@@ -2361,9 +3191,11 @@ class FacebookToolApp:
             self._refresh_platform_tool_accounts(platform)
             return
 
-        publish_window = self.create_modal(f"{platform_label} Publish Tool", "1060x660", modal=False)
+        publish_window = self.create_modal(f"Auto Post {platform_label}", "1320x740", modal=False)
         publish_window.resizable(True, True)
+        publish_window.minsize(1120, 650)
         self.platform_tool_windows[platform] = publish_window
+        self.platform_tool_stat_labels[platform] = {}
         publish_window.protocol("WM_DELETE_WINDOW", lambda: self._close_platform_tool(platform))
 
         shell = Frame(publish_window, bg=APP_BG)
@@ -2376,15 +3208,73 @@ class FacebookToolApp:
         stats = Frame(top, bg=SURFACE_BG)
         stats.pack(side=RIGHT, padx=12, pady=10)
 
+        Label(controls, text="New Country Type", bg=SURFACE_BG, fg=TEXT_MUTED, font=SMALL_FONT).grid(row=0, column=0, sticky="w")
+        store_entry = self.style_entry(Entry(controls, textvariable=self.legacy_store_name_var), width=22)
+        store_entry.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(2, 8))
+        Label(controls, text="Country Type", bg=SURFACE_BG, fg=TEXT_MUTED, font=SMALL_FONT).grid(row=0, column=1, sticky="w")
+        store_menu = ttk.Combobox(
+            controls,
+            textvariable=self.legacy_store_var,
+            values=tuple(self.legacy_stores),
+            state="readonly",
+            width=20,
+        )
+        store_menu.grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(2, 8))
+        store_menu.bind("<<ComboboxSelected>>", lambda _event: self._select_account_type())
+        self.platform_tool_country_type_menus[platform] = store_menu
+        self.create_button(
+            controls,
+            "Add",
+            self._create_legacy_store,
+            kind="secondary",
+            compact=True,
+        ).grid(row=1, column=2, sticky="ew", padx=(0, 8), pady=(2, 8))
+        self.create_button(
+            controls,
+            "Remove",
+            self._remove_legacy_store,
+            kind="neutral",
+            compact=True,
+        ).grid(row=1, column=3, sticky="ew", pady=(2, 8))
+
+        Label(controls, text="New Account Type", bg=SURFACE_BG, fg=TEXT_MUTED, font=SMALL_FONT).grid(row=2, column=0, sticky="w")
+        account_type_entry = self.style_entry(Entry(controls, textvariable=self.account_group_name_var), width=22)
+        account_type_entry.grid(row=3, column=0, sticky="ew", padx=(0, 8), pady=(2, 8))
+        Label(controls, text="Account Type", bg=SURFACE_BG, fg=TEXT_MUTED, font=SMALL_FONT).grid(row=2, column=1, sticky="w")
+        account_type_menu = ttk.Combobox(
+            controls,
+            textvariable=self.account_group_var,
+            values=tuple(self.account_groups),
+            state="readonly",
+            width=20,
+        )
+        account_type_menu.grid(row=3, column=1, sticky="ew", padx=(0, 8), pady=(2, 8))
+        account_type_menu.bind("<<ComboboxSelected>>", lambda _event: self._select_custom_account_type())
+        self.platform_tool_account_type_menus[platform] = account_type_menu
+        self.create_button(
+            controls,
+            "Add",
+            self._create_custom_account_type,
+            kind="secondary",
+            compact=True,
+        ).grid(row=3, column=2, sticky="ew", padx=(0, 8), pady=(2, 8))
+        self.create_button(
+            controls,
+            "Remove",
+            self._remove_custom_account_type,
+            kind="neutral",
+            compact=True,
+        ).grid(row=3, column=3, sticky="ew", pady=(2, 8))
+
         Label(
             controls,
             text=f"Auto Post {platform_label}",
             bg=SURFACE_BG,
             fg=TEXT_PRIMARY,
             font=TITLE_FONT,
-        ).grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
+        ).grid(row=4, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
         Label(controls, text="Function", bg=SURFACE_BG, fg=TEXT_MUTED, font=SMALL_FONT).grid(
-            row=1,
+            row=5,
             column=0,
             sticky="w",
         )
@@ -2396,49 +3286,32 @@ class FacebookToolApp:
             state="readonly",
             width=22,
         )
-        function_menu.grid(row=2, column=0, sticky="ew", padx=(0, 8))
+        function_menu.grid(row=6, column=0, sticky="ew", padx=(0, 8))
 
-        Label(controls, text="New Name", bg=SURFACE_BG, fg=TEXT_MUTED, font=SMALL_FONT).grid(row=1, column=1, sticky="w")
-        name_entry = self.style_entry(Entry(controls), width=22)
-        name_entry.grid(row=2, column=1, sticky="ew", padx=(0, 8))
-
-        self.create_button(
-            controls,
-            "Create",
-            lambda: self._platform_tool_set_status(platform, "Name field kept for account setup notes."),
-            kind="secondary",
-            compact=True,
-        ).grid(row=2, column=2, sticky="ew", padx=(0, 8))
-        self.create_button(
-            controls,
-            "Remove",
-            lambda: name_entry.delete(0, "end"),
-            kind="neutral",
-            compact=True,
-        ).grid(row=2, column=3, sticky="ew")
-
-        for column in range(2):
+        for column in range(4):
             controls.grid_columnconfigure(column, weight=1)
 
-        self._platform_tool_stat(stats, "Total Post", str(len(self.instances.active_instance_numbers())), SUCCESS)
-        self._platform_tool_stat(stats, "Failed", "0", DANGER)
-        self._platform_tool_stat(stats, "Success", "0", ACCENT)
+        self._platform_tool_stat(platform, stats, "Total Post", "0", SUCCESS)
+        self._platform_tool_stat(platform, stats, "No Login", "0", "#6b7280")
+        self._platform_tool_stat(platform, stats, "Failed", "0", DANGER)
+        self._platform_tool_stat(platform, stats, "Success", "0", ACCENT)
 
         body = Frame(shell, bg=SURFACE_ALT, highlightbackground=BORDER, highlightthickness=1, bd=0)
         body.pack(fill=BOTH, expand=True, pady=(10, 0))
 
-        left = Frame(body, bg=SURFACE_ALT)
-        left.pack(side=LEFT, fill=BOTH, expand=True, padx=12, pady=12)
-        right = Frame(body, bg=SURFACE_ALT, width=420)
+        right = Frame(body, bg=SURFACE_ALT, width=560)
         right.pack(side=RIGHT, fill=Y, padx=(0, 12), pady=12)
         right.pack_propagate(False)
+        publish_window._right_panel = right
+        left = Frame(body, bg=SURFACE_ALT)
+        left.pack(side=LEFT, fill=BOTH, expand=True, padx=12, pady=12)
 
         run_row = Frame(left, bg=SURFACE_ALT)
         run_row.pack(fill=X, pady=(0, 8))
         self.create_button(
             run_row,
             "Start Post",
-            lambda: self._run_platform_tool_selected(platform, function_var.get(), run_all=True),
+            lambda: self._run_platform_tool_selected(platform, function_var.get(), run_all=False),
             kind="success",
             compact=True,
         ).pack(side=LEFT, padx=(0, 6))
@@ -2507,62 +3380,163 @@ class FacebookToolApp:
 
         table_frame = Frame(left, bg=SURFACE_BG, highlightbackground=BORDER, highlightthickness=1, bd=0)
         table_frame.pack(fill=BOTH, expand=True)
-        columns = ("selected", "instance", "account", "name", "status", "process", "result")
+        columns = (
+            "selected",
+            "instance",
+            "local_account",
+            "country_type",
+            "account_type",
+            "account",
+            "name",
+            "ip",
+            "country",
+            "status",
+            "process",
+            "result",
+        )
         tree = ttk.Treeview(table_frame, columns=columns, show="headings", style="Report.Treeview", selectmode="extended")
         headings = {
             "selected": ("Use", 54),
             "instance": ("ID Acc", 80),
+            "local_account": ("Local", 120),
+            "country_type": ("Country Type", 110),
+            "account_type": ("Account Type", 120),
             "account": ("Account", 150),
             "name": ("Name", 160),
+            "ip": ("IP", 130),
+            "country": ("Country", 100),
             "status": ("Status", 90),
             "process": ("Process", 120),
             "result": ("Result", 160),
         }
         for key, (title, width) in headings.items():
             tree.heading(key, text=title)
-            tree.column(key, width=width, anchor="w")
+            tree.column(key, width=width, minwidth=width, anchor="w", stretch=False)
+        tree.tag_configure("live", background="#04e51f", foreground="#07320f")
+        tree.tag_configure("review", background="#f59e0b", foreground="#ffffff")
+        tree.tag_configure("login_required", background="#d1d5db", foreground="#111827")
+        tree.tag_configure("failed", background="#ff3b1f", foreground="#ffffff")
+        tree.tag_configure("ip_mismatch", background="#1f6feb", foreground="#ffffff")
+        tree.tag_configure("working", background="#1f6feb", foreground="#ffffff")
+        tree.tag_configure("select", background="#05CBE5", foreground="#010C03")
+        table_scroll_y = Scrollbar(table_frame, orient="vertical", command=tree.yview)
+        table_scroll_x = Scrollbar(table_frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=table_scroll_y.set, xscrollcommand=table_scroll_x.set)
+        table_scroll_y.pack(side=RIGHT, fill=Y)
+        table_scroll_x.pack(side="bottom", fill=X)
         tree.pack(side=LEFT, fill=BOTH, expand=True)
-        table_scroll = Scrollbar(table_frame, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=table_scroll.set)
-        table_scroll.pack(side=RIGHT, fill=Y)
         self.platform_tool_trees[platform] = tree
         tree.bind("<Button-1>", lambda event, p=platform: self._platform_tool_tree_click(event, p))
 
-        self._build_platform_tool_right_panel(right, publish_window, platform, platform_label)
+        self._build_platform_tool_right_panel(right, publish_window, platform, platform_label, function_var)
+        function_menu.bind("<<ComboboxSelected>>", lambda _event: self._refresh_platform_tool_input_panel(platform))
 
         status_label = Label(shell, text="Ready.", bg=APP_BG, fg=TEXT_MUTED, font=SMALL_FONT)
         status_label.pack(anchor="w", pady=(8, 0))
         self.platform_tool_status_labels[platform] = status_label
         self._refresh_platform_tool_accounts(platform)
+        self._apply_runtime_theme(publish_window)
 
-    def _build_platform_tool_right_panel(self, parent: Frame, window: Toplevel, platform: str, platform_label: str) -> None:
-        Label(parent, text="Publish Inputs", bg=SURFACE_ALT, fg=TEXT_PRIMARY, font=SECTION_FONT).pack(anchor="w")
+    def _build_platform_tool_right_panel(
+        self,
+        parent: Frame,
+        window: Toplevel,
+        platform: str,
+        platform_label: str,
+        function_var: tk.StringVar,
+    ) -> None:
+        parent._function_var = function_var
+        parent._platform_label = platform_label
+        self._render_platform_tool_input_panel(parent, window, platform)
+
+    def _refresh_platform_tool_input_panel(self, platform: str) -> None:
+        window = self.platform_tool_windows.get(platform)
+        if not window or not window.winfo_exists():
+            return
+        right_panel = getattr(window, "_right_panel", None)
+        if right_panel:
+            self._render_platform_tool_input_panel(right_panel, window, platform)
+
+    def _render_platform_tool_input_panel(self, parent: Frame, window: Toplevel, platform: str) -> None:
+        for child in parent.winfo_children():
+            child.destroy()
+
+        function_var = getattr(parent, "_function_var", tk.StringVar(master=window, value=self._platform_default_publish_action(platform)))
+        platform_label = getattr(parent, "_platform_label", self._platform_label())
+        function_label = function_var.get()
+        if platform == "facebook":
+            self._render_facebook_function_panel(parent, window, platform, function_label)
+            return
+        post_types = self._platform_post_types_for_function(platform, function_label)
+        post_type_var = tk.StringVar(master=window, value=post_types[0])
+        limit_var = self.vars.share_group_count_var
+        if not limit_var.get().strip():
+            limit_var.set("1")
+        command_var = tk.StringVar(master=window, value="Default")
+        system_var = tk.StringVar(master=window, value=platform_label)
+        random_count_var = tk.StringVar(master=window, value="3")
+        caption_from_file_var = tk.BooleanVar(master=window, value=False)
+        random_file_var = tk.BooleanVar(master=window, value=True)
+        cmd_post_var = tk.BooleanVar(master=window, value=False)
+        random_emoji_letters_var = tk.BooleanVar(master=window, value=False)
+        random_emoji_var = tk.BooleanVar(master=window, value=False)
+
+        Label(parent, text="Post Setup", bg=SURFACE_ALT, fg=TEXT_PRIMARY, font=SECTION_FONT).pack(anchor="w")
+
+        auto_row = Frame(parent, bg=SURFACE_ALT)
+        auto_row.pack(fill=X, pady=(8, 0))
+        self._styled_checkbutton(auto_row, "Remove Auto Number", tk.BooleanVar(master=window, value=True)).pack(side=LEFT)
 
         type_row = Frame(parent, bg=SURFACE_ALT)
         type_row.pack(fill=X, pady=(8, 0))
         Label(type_row, text="Post Type", bg=SURFACE_ALT, fg=TEXT_MUTED, font=SMALL_FONT).pack(side=LEFT)
-        post_type_var = tk.StringVar(master=window, value=self._platform_default_post_type(platform))
-        post_type_menu = ttk.Combobox(
+        ttk.Combobox(
             type_row,
             textvariable=post_type_var,
-            values=self._platform_post_types(platform),
+            values=post_types,
             state="readonly",
             width=18,
-        )
-        post_type_menu.pack(side=LEFT, padx=(8, 0))
-        Label(type_row, text="Limit", bg=SURFACE_ALT, fg=TEXT_MUTED, font=SMALL_FONT).pack(side=LEFT, padx=(10, 0))
-        limit_var = tk.StringVar(master=window, value="1")
+        ).pack(side=LEFT, padx=(8, 0))
+        Label(type_row, text="Limited Post", bg=SURFACE_ALT, fg=TEXT_MUTED, font=SMALL_FONT).pack(side=LEFT, padx=(10, 0))
         self.style_entry(Entry(type_row, textvariable=limit_var), width=5).pack(side=LEFT, padx=(6, 0))
 
-        self._styled_checkbutton(parent, "Remove Auto Number", tk.BooleanVar(master=window, value=True)).pack(
-            anchor="w",
-            pady=(8, 0),
-        )
+        option_row = Frame(parent, bg=SURFACE_ALT)
+        option_row.pack(fill=X, pady=(8, 0))
+        self._styled_checkbutton(option_row, "Caption from file", caption_from_file_var).pack(side=LEFT)
+        self._styled_checkbutton(option_row, "Random file", random_file_var).pack(side=LEFT, padx=(8, 0))
+        self._styled_checkbutton(option_row, "Cmd Post", cmd_post_var).pack(side=LEFT, padx=(8, 0))
+        ttk.Combobox(
+            option_row,
+            textvariable=command_var,
+            values=("Default", "No Comment", "Custom"),
+            state="readonly",
+            width=12,
+        ).pack(side=LEFT, padx=(6, 0))
 
-        Label(parent, text="Caption Text", bg=SURFACE_ALT, fg=TEXT_MUTED, font=SMALL_FONT).pack(anchor="w", pady=(10, 2))
-        caption_box = tk.Text(
-            parent,
-            height=7,
+        editor_row = Frame(parent, bg=SURFACE_ALT)
+        editor_row.pack(fill=X, pady=(8, 0))
+        caption_box = self._platform_tool_textbox(editor_row, height=7)
+        caption_box.pack(side=LEFT, fill=BOTH, expand=True, padx=(0, 8))
+        caption_box.insert("1.0", self.vars.description_var.get())
+        caption_box.bind("<KeyRelease>", lambda _event: self.vars.description_var.set(caption_box.get("1.0", "end").strip()))
+        command_box = self._platform_tool_textbox(editor_row, height=7)
+        command_box.pack(side=LEFT, fill=BOTH, expand=True)
+
+        Label(parent, text="Path Video", bg=SURFACE_ALT, fg=SUCCESS, font=SMALL_FONT).pack(anchor="w", pady=(8, 2))
+        path_box = self._platform_tool_textbox(parent, height=4)
+        path_box.pack(fill=X)
+        path_box.insert("1.0", self.vars.reel_folder_or_file_var.get())
+        path_box.bind("<KeyRelease>", lambda _event: self.vars.reel_folder_or_file_var.set(path_box.get("1.0", "end").strip()))
+
+        random_row = Frame(parent, bg=SURFACE_ALT)
+        random_row.pack(fill=X, pady=(8, 0))
+        self._styled_checkbutton(random_row, "Random Emoji+Letters", random_emoji_letters_var).pack(side=LEFT)
+        spin = tk.Spinbox(
+            random_row,
+            from_=1,
+            to=99,
+            textvariable=random_count_var,
+            width=4,
             bg=INPUT_BG,
             fg=TEXT_PRIMARY,
             insertbackground=TEXT_PRIMARY,
@@ -2570,51 +3544,164 @@ class FacebookToolApp:
             highlightthickness=1,
             highlightbackground=BORDER,
             font=BODY_FONT,
-            wrap="word",
         )
-        caption_box.pack(fill=X)
-        caption_box.insert("1.0", self.vars.description_var.get())
-        caption_box.bind("<KeyRelease>", lambda _event: self.vars.description_var.set(caption_box.get("1.0", "end").strip()))
+        spin.pack(side=LEFT, padx=(8, 0))
 
-        comment_row = Frame(parent, bg=SURFACE_ALT)
-        comment_row.pack(fill=X, pady=(8, 0))
-        self._styled_checkbutton(comment_row, "Comment Post", tk.BooleanVar(master=window, value=False)).pack(side=LEFT)
-        comment_var = tk.StringVar(master=window, value="Default")
-        ttk.Combobox(comment_row, textvariable=comment_var, values=("Default", "No Comment", "Custom"), state="readonly", width=14).pack(
-            side=LEFT,
-            padx=(8, 0),
-        )
+        emoji_row = Frame(parent, bg=SURFACE_ALT)
+        emoji_row.pack(fill=X, pady=(6, 0))
+        self._styled_checkbutton(emoji_row, "Random Emoji", random_emoji_var).pack(side=LEFT)
 
-        Label(parent, text="Path Video / Media", bg=SURFACE_ALT, fg=TEXT_MUTED, font=SMALL_FONT).pack(anchor="w", pady=(10, 2))
-        media_row = Frame(parent, bg=SURFACE_ALT)
-        media_row.pack(fill=X)
-        media_entry = self.style_entry(Entry(media_row, textvariable=self.vars.reel_folder_or_file_var), width=42)
-        media_entry.pack(side=LEFT, fill=X, expand=True)
+        Label(parent, text="System Type", bg=SURFACE_ALT, fg=TEXT_MUTED, font=SMALL_FONT).pack(anchor="w", pady=(10, 2))
+        ttk.Combobox(
+            parent,
+            textvariable=system_var,
+            values=("Facebook", "TikTok", "YouTube", "Instagram"),
+            state="readonly",
+            width=24,
+        ).pack(anchor="w")
+
+        footer = Frame(parent, bg=SURFACE_ALT)
+        footer.pack(fill=X, pady=(14, 0))
         self.create_button(
-            media_row,
+            footer,
             "Add Video",
             self.browse_files,
             kind="warning",
             compact=True,
-        ).pack(side=LEFT, padx=(8, 0))
+        ).pack(side=LEFT, padx=(0, 8))
+        self.create_button(
+            footer,
+            "Save Setting",
+            lambda: self._save_platform_tool_settings(platform),
+            kind="success",
+            compact=True,
+        ).pack(side=LEFT, padx=(0, 8))
+        self.create_button(
+            footer,
+            "Open Selected",
+            lambda: self._run_platform_tool_selected(platform, function_label, run_all=False),
+            kind="primary",
+            compact=True,
+        ).pack(side=LEFT)
+        self.platform_tool_input_refs[platform] = {
+            "function_var": function_var,
+            "post_type_var": post_type_var,
+            "limit_var": limit_var,
+            "caption_box": caption_box,
+            "command_box": command_box,
+            "path_box": path_box,
+            "caption_from_file_var": caption_from_file_var,
+            "random_file_var": random_file_var,
+            "cmd_post_var": cmd_post_var,
+            "command_var": command_var,
+            "random_count_var": random_count_var,
+            "random_emoji_letters_var": random_emoji_letters_var,
+            "random_emoji_var": random_emoji_var,
+            "system_var": system_var,
+        }
+        self._apply_runtime_theme(parent)
 
-        misc_row = Frame(parent, bg=SURFACE_ALT)
-        misc_row.pack(fill=X, pady=(8, 0))
-        self._styled_checkbutton(misc_row, "Random Emoji", tk.BooleanVar(master=window, value=False)).pack(side=LEFT)
-        self._styled_checkbutton(misc_row, "Random Emoji+Letters", tk.BooleanVar(master=window, value=False)).pack(
-            side=LEFT,
-            padx=(8, 0),
-        )
+    def _render_facebook_function_panel(self, parent: Frame, window: Toplevel, platform: str, function_label: str) -> None:
+        action_value = self._platform_tool_action_value(platform, function_label)
+        normalized = action_value.lower()
+        refs: dict[str, object] = {}
 
-        Label(parent, text="System Type", bg=SURFACE_ALT, fg=TEXT_MUTED, font=SMALL_FONT).pack(anchor="w", pady=(10, 2))
-        system_var = tk.StringVar(master=window, value=platform_label)
-        ttk.Combobox(
+        Label(parent, text=function_label, bg=SURFACE_ALT, fg=TEXT_PRIMARY, font=SECTION_FONT).pack(anchor="w")
+        Label(
             parent,
-            textvariable=system_var,
-            values=("TikTok", "YouTube", "Instagram"),
-            state="readonly",
-            width=24,
-        ).pack(anchor="w")
+            text=f"Code folder: Facebook\\{function_label}",
+            bg=SURFACE_ALT,
+            fg=TEXT_MUTED,
+            font=SMALL_FONT,
+        ).pack(anchor="w", pady=(2, 8))
+
+        def field(label: str, variable, width: int = 30) -> Entry:
+            row = Frame(parent, bg=SURFACE_ALT)
+            row.pack(fill=X, pady=5)
+            Label(row, text=label, bg=SURFACE_ALT, fg=TEXT_MUTED, font=SMALL_FONT, width=18, anchor="w").pack(side=LEFT)
+            entry = Entry(row, textvariable=variable)
+            self.style_entry(entry, width=width)
+            entry.pack(side=LEFT, fill=X, expand=True, padx=(8, 0))
+            return entry
+
+        if normalized == "care":
+            field("Video Links", self.vars.video_link_var, 42)
+            field("Watch Count", self.vars.watch_count_var, 8)
+            self._hms_duration_row(parent, "Watch Duration", self.vars.watch_duration_var, window)
+            self._hms_duration_row(parent, "Scroll Duration", self.vars.scroll_duration_var, window)
+            field("Comment Text", self.vars.comment_text_var, 42)
+            field("Share Title", self.vars.share_title_var, 42)
+            checks = Frame(parent, bg=SURFACE_ALT)
+            checks.pack(fill=X, pady=(8, 0))
+            self._styled_checkbutton(checks, "Like", self.vars.like_video_var).pack(side=LEFT)
+            self._styled_checkbutton(checks, "Comment", self.vars.comment_video_var).pack(side=LEFT, padx=(8, 0))
+            self._styled_checkbutton(checks, "Share", self.vars.share_video_var).pack(side=LEFT, padx=(8, 0))
+            self._styled_checkbutton(checks, "Scroll", self.vars.scroll_var).pack(side=LEFT, padx=(8, 0))
+
+        elif normalized == "join_group":
+            field("Group URLs", self.vars.group_urls_var, 46)
+
+        elif normalized == "share_to_groups":
+            field("Video Link", self.vars.video_link_var, 46)
+            field("Group URLs", self.vars.group_urls_var, 46)
+            field("Share Count", self.vars.share_group_count_var, 8)
+            Label(parent, text="Post Text", bg=SURFACE_ALT, fg=TEXT_MUTED, font=SMALL_FONT).pack(anchor="w", pady=(8, 2))
+            post_box = self._platform_tool_textbox(parent, 7)
+            post_box.pack(fill=BOTH, expand=True)
+            post_box.insert("1.0", self.vars.post_text_var.get())
+            refs["post_box"] = post_box
+
+        elif normalized == "upload_reel":
+            row = Frame(parent, bg=SURFACE_ALT)
+            row.pack(fill=X, pady=(0, 8))
+            self._styled_checkbutton(row, "Reel", self.vars.switch_reel_var).pack(side=LEFT)
+            self._styled_checkbutton(row, "Video/Picture", self.vars.switch_video_var).pack(side=LEFT, padx=(8, 0))
+            self._styled_checkbutton(row, "Share", self.vars.switch_share_var).pack(side=LEFT, padx=(8, 0))
+            field("Page Link", self.vars.page_link_var, 46)
+            field("Share Count", self.vars.share_group_count_var, 8)
+            Label(parent, text="Reel / Video Files", bg=SURFACE_ALT, fg=TEXT_MUTED, font=SMALL_FONT).pack(anchor="w", pady=(8, 2))
+            path_box = self._platform_tool_textbox(parent, 4)
+            path_box.pack(fill=X)
+            path_box.insert("1.0", self.vars.reel_folder_or_file_var.get())
+            refs["path_box"] = path_box
+            self.create_button(parent, "Browse Video", self.browse_files, kind="secondary", compact=True).pack(anchor="w", pady=(6, 0))
+            Label(parent, text="Description", bg=SURFACE_ALT, fg=TEXT_MUTED, font=SMALL_FONT).pack(anchor="w", pady=(8, 2))
+            desc_box = self._platform_tool_textbox(parent, 5)
+            desc_box.pack(fill=X)
+            desc_box.insert("1.0", self.vars.description_var.get())
+            refs["caption_box"] = desc_box
+            self._styled_checkbutton(parent, "Include Description", self.vars.description_check_var).pack(anchor="w", pady=(6, 0))
+
+        elif normalized == "upload_photo_cover":
+            self.create_button(
+                parent,
+                "Open Photo/Cover Setup",
+                self._open_photo_cover_setup_window,
+                kind="secondary",
+                compact=True,
+            ).pack(anchor="w", pady=(0, 8))
+            Label(
+                parent,
+                text="Set photo, cover, and profile description per account before running.",
+                bg=SURFACE_ALT,
+                fg=TEXT_MUTED,
+                font=SMALL_FONT,
+                wraplength=500,
+                justify=LEFT,
+            ).pack(anchor="w")
+
+        elif normalized in {"login", "clear_data", "get_id", "get_gmail", "get_date"}:
+            target = {
+                "login": "Open Facebook login/profile session.",
+                "clear_data": "Clear cached browser data for selected profiles.",
+                "get_id": "Open profile About > Contact and basic info.",
+                "get_gmail": "Open Meta Accounts Center personal info.",
+                "get_date": "Open Facebook personal information page.",
+            }.get(normalized, "Run selected action.")
+            Label(parent, text=target, bg=SURFACE_ALT, fg=TEXT_PRIMARY, font=BODY_FONT, wraplength=500, justify=LEFT).pack(anchor="w")
+
+        else:
+            Label(parent, text="Select a Facebook function to show its settings.", bg=SURFACE_ALT, fg=TEXT_MUTED, font=BODY_FONT).pack(anchor="w")
 
         footer = Frame(parent, bg=SURFACE_ALT)
         footer.pack(fill=X, pady=(14, 0))
@@ -2627,28 +3714,111 @@ class FacebookToolApp:
         ).pack(side=LEFT, padx=(0, 8))
         self.create_button(
             footer,
-            "Open Upload Page",
-            lambda: self._run_platform_tool_selected(platform, self._platform_default_publish_action(platform), run_all=False),
+            "Open Selected",
+            lambda: self._run_platform_tool_selected(platform, function_label, run_all=False),
             kind="primary",
             compact=True,
         ).pack(side=LEFT)
+        refs["function_label"] = function_label
+        self.platform_tool_input_refs[platform] = refs
+        self._apply_runtime_theme(parent)
 
-    def _platform_tool_stat(self, parent: Frame, label: str, value: str, color: str) -> None:
+    def _platform_tool_textbox(self, parent: Frame, height: int) -> tk.Text:
+        return tk.Text(
+            parent,
+            height=height,
+            bg=INPUT_BG,
+            fg=TEXT_PRIMARY,
+            insertbackground=TEXT_PRIMARY,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=BORDER,
+            font=BODY_FONT,
+            wrap="word",
+        )
+
+    def _apply_platform_tool_panel_inputs(self, platform: str, function_label: str) -> str:
+        refs = self.platform_tool_input_refs.get(platform, {})
+        action_value = self._platform_tool_action_value(platform, function_label)
+        self.vars.action_var.set(action_value)
+
+        caption_box = refs.get("caption_box")
+        if isinstance(caption_box, tk.Text):
+            caption = caption_box.get("1.0", "end").strip()
+            self.vars.description_var.set(caption)
+            self.vars.description_check_var.set(bool(caption))
+
+        path_box = refs.get("path_box")
+        if isinstance(path_box, tk.Text):
+            self.vars.reel_folder_or_file_var.set(path_box.get("1.0", "end").strip())
+
+        command_box = refs.get("command_box")
+        command_text = command_box.get("1.0", "end").strip() if isinstance(command_box, tk.Text) else ""
+        post_box = refs.get("post_box")
+        if isinstance(post_box, tk.Text):
+            command_text = post_box.get("1.0", "end").strip()
+        if command_text:
+            self.vars.post_text_var.set(command_text)
+            if "group" in action_value:
+                self.vars.group_urls_var.set(command_text)
+
+        limit_var = refs.get("limit_var")
+        if hasattr(limit_var, "get"):
+            value = str(limit_var.get() or "").strip()
+            if value:
+                self.vars.share_group_count_var.set(value)
+
+        post_type_var = refs.get("post_type_var")
+        post_type = str(post_type_var.get() if hasattr(post_type_var, "get") else "").strip().lower()
+        target_text = f"{function_label} {post_type} {action_value}".lower()
+        self.vars.switch_reel_var.set("reel" in target_text)
+        self.vars.switch_video_var.set("video" in target_text or "upload" in target_text)
+        self.vars.switch_picture_var.set("photo" in target_text or "picture" in target_text or "cover" in target_text)
+        self.vars.switch_share_var.set("share" in target_text or "group" in target_text)
+        return action_value
+
+    def _platform_tool_stat(self, platform: str, parent: Frame, label: str, value: str, color: str) -> None:
         card = Frame(parent, bg=color, width=96, height=58)
         card.pack(side=LEFT, padx=(6, 0))
         card.pack_propagate(False)
         Label(card, text=label, bg=color, fg=TEXT_ON_DARK, font=SMALL_FONT).pack(anchor="w", padx=10, pady=(7, 0))
-        Label(card, text=value, bg=color, fg=TEXT_ON_DARK, font=("Bahnschrift SemiBold", 15)).pack(
+        value_label = Label(card, text=value, bg=color, fg=TEXT_ON_DARK, font=("Bahnschrift SemiBold", 15))
+        value_label.pack(
             anchor="w",
             padx=10,
         )
+        self.platform_tool_stat_labels.setdefault(platform, {})[label] = value_label
+
+    def _is_no_login_row(self, row: dict) -> bool:
+        status = str(row.get("status", "")).strip().lower()
+        reason = str(row.get("reason", "")).strip().lower()
+        status_reason = f"{status} {reason}"
+        return any(
+            marker in status_reason
+            for marker in (
+                "login required",
+                "login request",
+                "login cookie was not found",
+                "session cookie was not found",
+                "no saved cookies",
+                "no cookie",
+                "returned a login page",
+                "logged out",
+                "not logged in",
+                "not signed in",
+            )
+        )
 
     def _platform_default_publish_action(self, platform: str) -> str:
+        if platform == "facebook":
+            return "Login"
         if platform == "instagram":
             return "Create Post"
         return "Upload Video"
 
     def _platform_tool_function_labels(self, platform: str) -> tuple[str, ...]:
+        if platform == "facebook":
+            return tuple(label for label, _value in self.ACTIONS_BY_PLATFORM["facebook"])
         if platform == "youtube":
             return ("Upload Video", "YouTube Studio", "Shorts", "Open YouTube", "Analytics")
         if platform == "instagram":
@@ -2662,7 +3832,33 @@ class FacebookToolApp:
                 return action_value
         return "create_post" if platform == "instagram" else "upload_video"
 
+    def _platform_post_types_for_function(self, platform: str, function_label: str) -> tuple[str, ...]:
+        normalized = str(function_label or "").strip().lower()
+        if platform == "facebook":
+            if "reel" in normalized:
+                return ("Upload Reel", "Set New Path", "Post Video")
+            if "photo" in normalized or "cover" in normalized:
+                return ("Photo+Cover", "Set New Path", "Photo Mode")
+            if "share" in normalized or "group" in normalized:
+                return ("Share To Groups", "Post Text/Image/Video", "Set New Path")
+            if "login" in normalized or "profile" in normalized or "home" in normalized:
+                return ("Open Browser", "Set New Path")
+            return ("Set New Path", "Post Text/Image/Video", "Upload Reel", "Photo+Cover", "Share To Groups")
+        if platform == "youtube":
+            if "short" in normalized:
+                return ("Short", "Set New Path", "Video")
+            return ("Video", "Short", "Set New Path", "Community Post")
+        if platform == "instagram":
+            if "reel" in normalized:
+                return ("Reel", "Set New Path", "Post")
+            if "story" in normalized:
+                return ("Story", "Set New Path", "Post")
+            return ("Post", "Reel", "Story", "Set New Path")
+        return ("Set New Path", "Post Video", "Photo Mode")
+
     def _platform_post_types(self, platform: str) -> tuple[str, ...]:
+        if platform == "facebook":
+            return ("Post Text/Image/Video", "Upload Reel", "Photo+Cover")
         if platform == "youtube":
             return ("Video", "Short", "Community Post")
         if platform == "instagram":
@@ -2670,6 +3866,8 @@ class FacebookToolApp:
         return ("Set New Path", "Post Video", "Photo Mode")
 
     def _platform_default_post_type(self, platform: str) -> str:
+        if platform == "facebook":
+            return "Post Text/Image/Video"
         if platform == "youtube":
             return "Video"
         if platform == "instagram":
@@ -2681,44 +3879,118 @@ class FacebookToolApp:
         if not tree:
             return
         selected_instances = {
-            self._instance_number_from_label(str(tree.item(item, "values")[1]))
+            int(str(item))
             for item in tree.get_children()
             if str(tree.item(item, "values")[0]).strip() == "x"
+            and str(item).isdigit()
         }
-        selected_instances.discard(None)
         for item in tree.get_children():
             tree.delete(item)
+        account_type = self._selected_account_type()
+        custom_type = self._selected_custom_account_type()
+        total_count = 0
+        success_count = 0
+        failed_count = 0
+        no_login_count = 0
         for instance_number in self.instances.active_instance_numbers():
             report = self.state.instance_reports.get(instance_number, {})
+            if account_type and not self.instances.instance_matches_account_type(instance_number, account_type):
+                continue
+            if custom_type and str(report.get("custom_account_type") or "").strip().lower() != custom_type.lower():
+                continue
             session_name = self.state.instance_names.get(instance_number, f"Firefox {instance_number}")
             display_name = session_name
             if platform == "facebook":
                 display_name = self.state.profile_names.get(instance_number, session_name)
+            else:
+                display_name = self.state.profile_names.get(instance_number, session_name)
+            account_status = self.instances.report_account_status(report)
+            account_reason = str(report.get("account_reason") or report.get("last_note") or "")
+            row_for_status = {"status": account_status, "reason": account_reason}
+            total_count += 1
+            normalized_status = account_status.strip().lower()
+            if self._is_no_login_row(row_for_status):
+                no_login_count += 1
+            elif normalized_status in {"live", "done", "ready", "success", "cache cleared"}:
+                success_count += 1
+            elif any(
+                marker in normalized_status
+                for marker in ("checkpoint", "challenge", "verify", "disabled", "suspended", "locked", "die", "dead")
+            ):
+                failed_count += 1
             checked = "x" if instance_number in selected_instances else ""
+            row_tags = self._report_row_tags(
+                {
+                    "status": account_status,
+                    "reason": account_reason,
+                    "country_type": report.get("account_type") or report.get("country") or "",
+                    "account_type": report.get("custom_account_type") or "",
+                },
+                tree,
+            )
+            if checked:
+                row_tags = tuple(tag for tag in row_tags if tag != "select") + ("select",)
             tree.insert(
                 "",
                 "end",
+                iid=str(instance_number),
                 values=(
                     checked,
-                    f"Firefox {instance_number}",
+                    self.instances._display_firefox_label(instance_number, report),
+                    self.instances._local_account_label(instance_number, report),
+                    report.get("account_type") or report.get("country") or "",
+                    report.get("custom_account_type") or "-",
                     session_name,
                     display_name,
-                    self.state.run_states.get(instance_number, "Idle"),
+                    report.get("ip", ""),
+                    report.get("country", ""),
+                    account_status,
                     report.get("last_action", "None"),
-                    report.get("last_note", ""),
+                    account_reason,
                 ),
+                tags=row_tags,
             )
+        self._refresh_platform_tool_stats(platform, total_count, no_login_count, failed_count, success_count)
+
+    def _refresh_platform_tool_stats(
+        self,
+        platform: str,
+        total_count: int,
+        no_login_count: int,
+        failed_count: int,
+        success_count: int,
+    ) -> None:
+        labels = self.platform_tool_stat_labels.get(platform, {})
+        values = {
+            "Total Post": total_count,
+            "No Login": no_login_count,
+            "Failed": failed_count,
+            "Success": success_count,
+        }
+        for label, value in values.items():
+            value_label = labels.get(label)
+            if value_label:
+                value_label.config(text=str(value))
 
     def _platform_tool_tree_click(self, event, platform: str) -> None:
         tree = self.platform_tool_trees.get(platform)
-        if not tree or tree.identify_column(event.x) != "#1":
-            return
+        if not tree:
+            return None
+        if tree.identify_region(event.x, event.y) == "heading":
+            return None
         row_id = tree.identify_row(event.y)
         if not row_id:
-            return
+            return None
         values = list(tree.item(row_id, "values"))
-        values[0] = "" if str(values[0]).strip() == "x" else "x"
+        selected = str(values[0]).strip() != "x"
+        values[0] = "x" if selected else ""
         tree.item(row_id, values=values)
+        tags = tuple(tag for tag in tree.item(row_id, "tags") if tag != "select")
+        if selected:
+            tags = tags + ("select",)
+        tree.item(row_id, tags=tags)
+        tree.selection_remove(tree.selection())
+        return "break"
 
     def _platform_tool_toggle_all(self, platform: str, checked: bool) -> None:
         tree = self.platform_tool_trees.get(platform)
@@ -2727,27 +3999,39 @@ class FacebookToolApp:
         for item in tree.get_children():
             values = list(tree.item(item, "values"))
             values[0] = "x" if checked else ""
-            tree.item(item, values=values)
+            tags = tuple(tag for tag in tree.item(item, "tags") if tag != "select")
+            if checked:
+                tags = tags + ("select",)
+            tree.item(item, values=values, tags=tags)
 
     def _platform_tool_selected_instances(self, platform: str, run_all: bool) -> list[int]:
         tree = self.platform_tool_trees.get(platform)
         if not tree:
             return []
-        row_ids = tree.get_children() if run_all else tree.selection()
-        if not row_ids:
-            row_ids = [item for item in tree.get_children() if str(tree.item(item, "values")[0]).strip() == "x"]
+        checked_row_ids = [
+            item for item in tree.get_children() if str(tree.item(item, "values")[0]).strip() == "x"
+        ]
+        if checked_row_ids:
+            row_ids = checked_row_ids
+        elif run_all:
+            row_ids = tree.get_children()
+        else:
+            row_ids = tree.selection()
         numbers: list[int] = []
         for item in row_ids:
-            values = tree.item(item, "values")
-            if len(values) < 2:
-                continue
-            number = self._instance_number_from_label(str(values[1]))
+            try:
+                number = int(str(item))
+            except Exception:
+                values = tree.item(item, "values")
+                if len(values) < 2:
+                    continue
+                number = self._instance_number_from_label(str(values[1]))
             if number is not None:
                 numbers.append(number)
         return numbers
 
     def _run_platform_tool_selected(self, platform: str, function_label: str, run_all: bool) -> None:
-        action_value = self._platform_tool_action_value(platform, function_label)
+        action_value = self._apply_platform_tool_panel_inputs(platform, function_label)
         selected_instances = self._platform_tool_selected_instances(platform, run_all)
         if not selected_instances:
             self._platform_tool_set_status(platform, "No account rows selected.")
@@ -2757,9 +4041,59 @@ class FacebookToolApp:
         self._render_action_buttons()
         self.refresh_dashboard()
         self._platform_tool_set_status(platform, f"Starting {len(selected_instances)} {self._platform_label()} session(s).")
+        if platform == "facebook" and self._run_facebook_folder_action(function_label, action_value, selected_instances):
+            self.root.after(500, lambda: self._refresh_platform_tool_accounts(platform))
+            return
         for instance_number in selected_instances:
             threading.Thread(target=self.instances.run_firefox_instance, args=(instance_number,), daemon=True).start()
         self.root.after(500, lambda: self._refresh_platform_tool_accounts(platform))
+
+    def _run_facebook_folder_action(self, function_label: str, action_value: str, instance_numbers: list[int]) -> bool:
+        action_path = PLATFORM_FOLDER_DIRS["facebook"] / function_label / "action.py"
+        if not action_path.exists():
+            return False
+
+        def worker() -> None:
+            action_name = function_label.strip() or action_value
+            for instance_number in instance_numbers:
+                self.instances._update_instance_report(
+                    instance_number,
+                    action=action_name,
+                    status="Running",
+                    increment_run=True,
+                )
+                self.instances.set_run_status(instance_number, "Running", WARNING, persist_report=False)
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    f"fbv1_facebook_action_{action_value}",
+                    action_path,
+                )
+                if spec is None or spec.loader is None:
+                    raise RuntimeError(f"Cannot load action file: {action_path}")
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                run_action = getattr(module, "run", None)
+                if not callable(run_action):
+                    raise RuntimeError(f"{action_path} does not define run(app, instance_numbers).")
+                run_action(self, instance_numbers)
+                done_status = "Ready" if action_value == "login" else "Done"
+                for instance_number in instance_numbers:
+                    self.instances.set_run_status(instance_number, done_status, SUCCESS)
+            except Exception as exc:
+                for instance_number in instance_numbers:
+                    self.instances.set_run_status(instance_number, "Failed", DANGER)
+                    self.instances._update_instance_report(
+                        instance_number,
+                        action=action_name,
+                        status="Failed",
+                        note=str(exc),
+                    )
+                self.root.after(0, lambda text=f"{action_name} failed: {exc}": self._platform_tool_set_status("facebook", text))
+            finally:
+                self.root.after(0, lambda: self._refresh_platform_tool_accounts("facebook"))
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
 
     def _clear_platform_tool_selected(self, platform: str) -> None:
         selected_instances = self._platform_tool_selected_instances(platform, run_all=False)
@@ -2793,6 +4127,10 @@ class FacebookToolApp:
         window = self.platform_tool_windows.pop(platform, None)
         self.platform_tool_trees.pop(platform, None)
         self.platform_tool_status_labels.pop(platform, None)
+        self.platform_tool_stat_labels.pop(platform, None)
+        self.platform_tool_input_refs.pop(platform, None)
+        self.platform_tool_country_type_menus.pop(platform, None)
+        self.platform_tool_account_type_menus.pop(platform, None)
         if window and window.winfo_exists():
             window.destroy()
 
@@ -2806,15 +4144,17 @@ class FacebookToolApp:
 
         self._styled_checkbutton(body, "Watch Video", self.vars.watch_video_var).pack(anchor="w")
         self._entry_row(body, "Number of Videos", self.vars.watch_count_var)
-        self._entry_row(body, "Duration per Video (seconds)", self.vars.watch_duration_var)
+        self._hms_duration_row(body, "Watch Duration", self.vars.watch_duration_var, care_window, surface_bg=SURFACE_BG)
         self._styled_checkbutton(body, "Link Video", self.vars.link_video_var).pack(anchor="w", pady=(8, 0))
         self._entry_row(body, "Video Link", self.vars.video_link_var)
 
         comment_video_check = self._styled_checkbutton(body, "Comment on Video", self.vars.comment_video_var)
         comment_video_check.pack(anchor="w", pady=(8, 0))
         self._entry_row(body, "Comment Text", self.vars.comment_text_var)
+        self._styled_checkbutton(body, "Share Video", self.vars.share_video_var).pack(anchor="w", pady=(8, 0))
+        self._entry_row(body, "Share Title", self.vars.share_title_var)
         self._styled_checkbutton(body, "Scroll between Videos", self.vars.scroll_var).pack(anchor="w", pady=(8, 0))
-        self._entry_row(body, "Scroll Duration (seconds)", self.vars.scroll_duration_var)
+        self._hms_duration_row(body, "Scroll Duration", self.vars.scroll_duration_var, care_window, surface_bg=SURFACE_BG)
 
         def toggle_interactions(*_args) -> None:
             state = "normal" if self.vars.link_video_var.get() else "disabled"
@@ -2962,6 +4302,44 @@ class FacebookToolApp:
         self.style_entry(entry, width=width)
         entry.pack(side=LEFT, padx=(12, 0))
         return entry
+
+    def _hms_duration_row(self, parent: Frame, label_text: str, target_var, master, surface_bg: str = SURFACE_ALT) -> None:
+        row = Frame(parent, bg=surface_bg)
+        row.pack(fill=X, pady=5)
+        Label(row, text=label_text, bg=surface_bg, fg=TEXT_MUTED, font=SMALL_FONT, width=18, anchor="w").pack(side=LEFT)
+
+        hours, minutes, seconds = self._seconds_to_hms(target_var.get())
+        hour_var = tk.StringVar(master=master, value=str(hours))
+        minute_var = tk.StringVar(master=master, value=str(minutes))
+        second_var = tk.StringVar(master=master, value=str(seconds))
+
+        def sync_total_seconds(*_args) -> None:
+            try:
+                total = max(0, int(hour_var.get() or 0)) * 3600
+                total += max(0, int(minute_var.get() or 0)) * 60
+                total += max(0, int(second_var.get() or 0))
+            except ValueError:
+                return
+            target_var.set(str(total))
+
+        for text, var in (("H", hour_var), ("M", minute_var), ("S", second_var)):
+            entry = Entry(row, textvariable=var)
+            self.style_entry(entry, width=4)
+            entry.pack(side=LEFT, padx=(8, 3))
+            Label(row, text=text, bg=surface_bg, fg=TEXT_MUTED, font=SMALL_FONT).pack(side=LEFT)
+            var.trace_add("write", sync_total_seconds)
+
+        sync_total_seconds()
+
+    def _seconds_to_hms(self, value: str) -> tuple[int, int, int]:
+        try:
+            total_seconds = max(0, int(float(str(value or "0").strip() or 0)))
+        except ValueError:
+            total_seconds = 0
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+        return hours, minutes, seconds
 
     def browse_files(self) -> None:
         file_paths = filedialog.askopenfilenames(

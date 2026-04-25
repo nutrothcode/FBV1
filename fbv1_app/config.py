@@ -11,18 +11,42 @@ IMAGE_DIR = BASE_DIR / "images"
 COOKIE_DIR = BASE_DIR / "cookies"
 DATA_DIR = BASE_DIR / "data"
 BACKUP_DIR = BASE_DIR / "backups"
+PLATFORM_FOLDER_DIRS = {
+    "facebook": BASE_DIR / "Facebook",
+    "tiktok": BASE_DIR / "TikTok",
+    "youtube": BASE_DIR / "YouTube",
+    "instagram": BASE_DIR / "Instagram",
+}
 DATA_FILE = BASE_DIR / "firefox_instances.json"
 APP_DB_PATH = DATA_DIR / "fbv1_accounts.db"
 GECKODRIVER_PATH = ACCOUNT_DIR / "geckodriver.exe"
 LOGO_PATH = ACCOUNT_DIR / "fb logo.png"
 ICON_PATH = ACCOUNT_DIR / "fb logo.png"
 
-for folder in (FIREFOX_USER_DATA_DIR, IMAGE_DIR, COOKIE_DIR, DATA_DIR, BACKUP_DIR):
+for folder in (FIREFOX_USER_DATA_DIR, IMAGE_DIR, COOKIE_DIR, DATA_DIR, BACKUP_DIR, *PLATFORM_FOLDER_DIRS.values()):
     folder.mkdir(parents=True, exist_ok=True)
 
 
 def image_account_dir(instance_number: int) -> Path:
     folder = IMAGE_DIR / f"Firefox_{instance_number}"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def firefox_user_data_dir_for_platform(platform: str) -> Path:
+    if platform == "facebook":
+        folder = FIREFOX_USER_DATA_DIR
+    else:
+        folder = PLATFORM_FOLDER_DIRS.get(platform, BASE_DIR / platform.title()) / "Firefox Profiles"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def cookie_dir_for_platform(platform: str) -> Path:
+    if platform == "facebook":
+        folder = COOKIE_DIR
+    else:
+        folder = PLATFORM_FOLDER_DIRS.get(platform, BASE_DIR / platform.title()) / "cookies"
     folder.mkdir(parents=True, exist_ok=True)
     return folder
 

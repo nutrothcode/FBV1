@@ -2,28 +2,38 @@ from __future__ import annotations
 
 import csv
 from datetime import datetime
+from html import unescape
 import json
 import logging
 import os
+import queue
 import re
 import shutil
+import sqlite3
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import TYPE_CHECKING
 
 from PIL import Image, ImageOps, ImageTk
+from selenium import webdriver
+from selenium.webdriver.firefox.options import Options as FirefoxOptions
+from selenium.webdriver.firefox.service import Service as FirefoxService
 
 from .config import (
     APP_DB_PATH,
     BACKUP_DIR,
     COOKIE_DIR,
     DATA_FILE,
-    FIREFOX_USER_DATA_DIR,
+    GECKODRIVER_PATH,
     IMAGE_DIR,
+    PLATFORM_FOLDER_DIRS,
     avatar_image_path,
     cover_image_path,
+    cookie_dir_for_platform,
+    firefox_user_data_dir_for_platform,
 )
 from .storage import AccountStateStore
 from .theme import ACCENT, BORDER, DANGER, SECTION_FONT, SMALL_FONT, SUCCESS, SURFACE_ALT, SURFACE_BG, TEXT_MUTED, TEXT_PRIMARY, WARNING
@@ -38,6 +48,12 @@ class InstanceManager:
         "tiktok": "https://www.tiktok.com",
         "youtube": "https://www.youtube.com",
         "instagram": "https://www.instagram.com",
+    }
+    PLATFORM_CHECK_URLS = {
+        "facebook": "https://www.facebook.com/me",
+        "tiktok": "https://www.tiktok.com",
+        "youtube": "https://www.youtube.com",
+        "instagram": "https://www.instagram.com/accounts/edit/",
     }
     PLATFORM_ACTION_URLS = {
         "tiktok": {
@@ -69,6 +85,9 @@ class InstanceManager:
     def __init__(self, app: "FacebookToolApp") -> None:
         self.app = app
         self.storage = AccountStateStore(APP_DB_PATH, BACKUP_DIR)
+        self.platform_states: dict[str, dict] = {}
+        self.current_platform = "facebook"
+        self._route_identity_cache: dict[str, tuple[float, str, str]] = {}
 
     @property
     def state(self):
@@ -77,6 +96,250 @@ class InstanceManager:
     @property
     def vars(self):
         return self.app.vars
+
+    def firefox_profile_dir(self, instance_number: int, platform: str | None = None):
+        platform = platform or self.vars.platform_var.get()
+        report = self.state.instance_reports.get(instance_number, {})
+        account_type = str(report.get("account_type") or report.get("country") or "").strip()
+        try:
+            local_index = int(report.get("local_index") or 0)
+        except Exception:
+            local_index = 0
+        if account_type and local_index > 0:
+            root = firefox_user_data_dir_for_platform(platform)
+            safe_type = self._safe_folder_name(account_type)
+            target = root / safe_type / f"Firefox_{local_index}"
+            source = root / f"Firefox_{instance_number}"
+            if source.exists() and not target.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.move(str(source), str(target))
+                except Exception as exc:
+                    logging.warning("Could not migrate Firefox profile %s to %s: %s", source, target, exc)
+            return target
+        return firefox_user_data_dir_for_platform(platform) / f"Firefox_{instance_number}"
+
+    def _safe_folder_name(self, value: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "").strip())
+        cleaned = cleaned.strip("._-")
+        return cleaned or "Default"
+
+    def switch_platform(self, platform: str) -> None:
+        if platform not in self.PLATFORM_HOME_URLS:
+            platform = "facebook"
+        previous_platform = self.current_platform
+        self.platform_states[previous_platform] = self._snapshot_current_platform_state()
+        if platform != previous_platform:
+            self._close_current_drivers()
+        self.current_platform = platform
+        self.vars.platform_var.set(platform)
+        self._load_platform_state(platform)
+        self.save_instance_data()
+
+    def _snapshot_current_platform_state(self) -> dict:
+        return {
+            "credentials": dict(self.state.credentials_dict),
+            "instance_names": dict(self.state.instance_names),
+            "profile_names": dict(self.state.profile_names),
+            "preview_updated_at": dict(self.state.preview_updated_at),
+            "run_states": dict(self.state.run_states),
+            "instance_reports": dict(self.state.instance_reports),
+            "backend_profile_ids": dict(self.state.backend_profile_ids),
+            "photo_upload_paths": dict(self.state.photo_upload_paths),
+            "cover_upload_paths": dict(self.state.cover_upload_paths),
+            "photo_upload_descriptions": dict(self.state.photo_upload_descriptions),
+            "country_types": [
+                value for value in getattr(self.app, "legacy_stores", ["All"]) if str(value or "").strip()
+            ],
+            "custom_account_types": [
+                value for value in getattr(self.app, "account_groups", ["All"]) if str(value or "").strip()
+            ],
+            "deleted_instances": list(self.state.deleted_instances),
+            "active_instances": [
+                i + 1 for i, (_button, frame) in enumerate(self.state.firefox_buttons) if frame is not None
+            ],
+        }
+
+    def _normalize_platform_state(self, raw_state: dict | None) -> dict:
+        raw_state = raw_state if isinstance(raw_state, dict) else {}
+
+        def int_keyed_dict(field_name: str) -> dict[int, object]:
+            values = raw_state.get(field_name, {})
+            if not isinstance(values, dict):
+                return {}
+            output: dict[int, object] = {}
+            for key, value in values.items():
+                try:
+                    output[int(key)] = value
+                except (TypeError, ValueError):
+                    continue
+            return output
+
+        def int_set(field_name: str) -> set[int]:
+            values = raw_state.get(field_name, [])
+            if not isinstance(values, list):
+                return set()
+            output: set[int] = set()
+            for value in values:
+                try:
+                    output.add(int(value))
+                except (TypeError, ValueError):
+                    continue
+            return output
+
+        def int_list(field_name: str) -> list[int]:
+            values = raw_state.get(field_name, [])
+            if not isinstance(values, list):
+                return []
+            output: list[int] = []
+            for value in values:
+                try:
+                    output.append(int(value))
+                except (TypeError, ValueError):
+                    continue
+            return output
+
+        def str_list(field_name: str) -> list[str]:
+            values = raw_state.get(field_name, [])
+            if not isinstance(values, list):
+                return []
+            output: list[str] = []
+            seen: set[str] = set()
+            for value in values:
+                clean = str(value or "").strip()
+                if not clean or clean.lower() in seen:
+                    continue
+                seen.add(clean.lower())
+                output.append(clean)
+            return output
+
+        return {
+            "credentials": {key: str(value) for key, value in int_keyed_dict("credentials").items()},
+            "instance_names": {key: str(value) for key, value in int_keyed_dict("instance_names").items()},
+            "profile_names": {key: str(value) for key, value in int_keyed_dict("profile_names").items()},
+            "preview_updated_at": {key: str(value) for key, value in int_keyed_dict("preview_updated_at").items()},
+            "run_states": {key: str(value) for key, value in int_keyed_dict("run_states").items()},
+            "instance_reports": {
+                key: value for key, value in int_keyed_dict("instance_reports").items() if isinstance(value, dict)
+            },
+            "backend_profile_ids": {key: str(value) for key, value in int_keyed_dict("backend_profile_ids").items() if value},
+            "photo_upload_paths": {key: str(value) for key, value in int_keyed_dict("photo_upload_paths").items() if value},
+            "cover_upload_paths": {key: str(value) for key, value in int_keyed_dict("cover_upload_paths").items() if value},
+            "photo_upload_descriptions": {
+                key: str(value) for key, value in int_keyed_dict("photo_upload_descriptions").items() if value is not None
+            },
+            "country_types": str_list("country_types"),
+            "custom_account_types": str_list("custom_account_types"),
+            "deleted_instances": int_set("deleted_instances"),
+            "active_instances": int_list("active_instances"),
+        }
+
+    def _empty_platform_state(self) -> dict:
+        return {
+            "credentials": {},
+            "instance_names": {},
+            "profile_names": {},
+            "preview_updated_at": {},
+            "run_states": {},
+            "instance_reports": {},
+            "backend_profile_ids": {},
+            "photo_upload_paths": {},
+            "cover_upload_paths": {},
+            "photo_upload_descriptions": {},
+            "country_types": ["All"],
+            "custom_account_types": ["All"],
+            "deleted_instances": set(),
+            "active_instances": [],
+        }
+
+    def _remove_copied_non_facebook_states(self) -> None:
+        facebook_state = self._normalize_platform_state(self.platform_states.get("facebook"))
+        facebook_active = set(facebook_state["active_instances"])
+        if not facebook_active:
+            return
+        for platform in ("tiktok", "youtube", "instagram"):
+            platform_state = self._normalize_platform_state(self.platform_states.get(platform))
+            platform_active = set(platform_state["active_instances"])
+            if platform_active != facebook_active:
+                continue
+            profile_root = firefox_user_data_dir_for_platform(platform)
+            has_platform_profiles = any(profile_root.glob("Firefox_*"))
+            if not has_platform_profiles:
+                self.platform_states[platform] = self._empty_platform_state()
+
+    def _serializable_platform_states(self) -> dict[str, dict]:
+        output: dict[str, dict] = {}
+        for platform, platform_state in self.platform_states.items():
+            if platform not in self.PLATFORM_HOME_URLS:
+                continue
+            normalized = self._normalize_platform_state(platform_state)
+            output[platform] = {
+                "credentials": normalized["credentials"],
+                "instance_names": normalized["instance_names"],
+                "profile_names": normalized["profile_names"],
+                "preview_updated_at": normalized["preview_updated_at"],
+                "run_states": normalized["run_states"],
+                "instance_reports": normalized["instance_reports"],
+                "backend_profile_ids": normalized["backend_profile_ids"],
+                "photo_upload_paths": normalized["photo_upload_paths"],
+                "cover_upload_paths": normalized["cover_upload_paths"],
+                "photo_upload_descriptions": normalized["photo_upload_descriptions"],
+                "country_types": normalized["country_types"],
+                "custom_account_types": normalized["custom_account_types"],
+                "deleted_instances": sorted(normalized["deleted_instances"]),
+                "active_instances": normalized["active_instances"],
+            }
+        return output
+
+    def _load_platform_state(self, platform: str) -> None:
+        platform_state = self._normalize_platform_state(self.platform_states.get(platform))
+        self._clear_visible_instances()
+        self.state.credentials_dict = platform_state["credentials"]
+        self.state.instance_names = platform_state["instance_names"]
+        self.state.profile_names = platform_state["profile_names"]
+        self.state.preview_updated_at = platform_state["preview_updated_at"]
+        self.state.run_states = platform_state["run_states"]
+        self.state.instance_reports = platform_state["instance_reports"]
+        self.state.backend_profile_ids = platform_state["backend_profile_ids"]
+        self.state.photo_upload_paths = platform_state["photo_upload_paths"]
+        self.state.cover_upload_paths = platform_state["cover_upload_paths"]
+        self.state.photo_upload_descriptions = platform_state["photo_upload_descriptions"]
+        self.state.deleted_instances = platform_state["deleted_instances"]
+        self._hydrate_reports_from_cookie_files()
+        for instance_number in platform_state["active_instances"]:
+            self.open_firefox_instances(1, start_index=instance_number)
+        self.sync_local_profiles_to_backend_async()
+
+    def _clear_visible_instances(self) -> None:
+        for _button, frame in self.state.firefox_buttons:
+            if frame:
+                frame.destroy()
+        self.state.firefox_buttons.clear()
+        self.state.credential_entries.clear()
+        self.state.image_labels.clear()
+        self.state.cover_labels.clear()
+        self.state.avatar_labels.clear()
+        self.state.avatar_name_labels.clear()
+        self.state.instance_media_frames.clear()
+        self.state.instance_text_frames.clear()
+        self.state.instance_title_labels.clear()
+        self.state.instance_hint_labels.clear()
+        self.state.instance_detail_labels.clear()
+        self.state.preview_status_labels.clear()
+        self.state.run_status_labels.clear()
+        self.state.instance_body_frames.clear()
+        self.state.preview_monitor_tokens.clear()
+
+    def _close_current_drivers(self) -> None:
+        for driver in list(self.state.drivers.values()):
+            try:
+                driver.quit()
+            except Exception:
+                pass
+        self.state.drivers.clear()
+        self.app.browser._instance_slots.clear()
+        self.app.browser._driver_modes.clear()
+        self.app.browser._launching_instances.clear()
 
     def open_firefox_instances(
         self,
@@ -88,8 +351,15 @@ class InstanceManager:
             if i in self.state.deleted_instances:
                 continue
 
-            instance_folder = FIREFOX_USER_DATA_DIR / f"Firefox_{i}"
+            instance_folder = self.firefox_profile_dir(i)
             instance_folder.mkdir(parents=True, exist_ok=True)
+            selected_type = self._selected_account_type_from_app()
+            if selected_type:
+                report = self._ensure_instance_report(i)
+                if not str(report.get("account_type") or "").strip():
+                    report["account_type"] = selected_type
+                if not str(report.get("expected_country") or "").strip():
+                    report["expected_country"] = self._expected_country_from_account_type(str(report.get("account_type") or selected_type))
 
             instance_frame = self.app.Frame(
                 self.app.button_frame,
@@ -339,6 +609,15 @@ class InstanceManager:
         if self.state.batch_stop_requested:
             self.set_run_status(instance_number, "Stopped", WARNING)
             return
+        if not self.allow_open_for_expected_country(instance_number):
+            self._update_instance_report(
+                instance_number,
+                action=self._action_label(self.vars.action_var.get()),
+                status="IP mismatch",
+                note="Blocked because current IP country does not match expected country.",
+            )
+            self.save_instance_data()
+            return
         action = self.vars.action_var.get()
         action_label = self._action_label(action)
         self._update_instance_report(instance_number, action=action_label, status="Queued", increment_run=True)
@@ -398,13 +677,9 @@ class InstanceManager:
                 else:
                     self.set_run_status(instance_number, "Failed", DANGER)
             elif action == "get_gmail":
-                self.app.browser.open_firefox_instance(instance_number, login=False)
-                self.app.browser.get_gmail(instance_number)
-                self.set_run_status(instance_number, "Done", SUCCESS)
+                self.check_live_instance(instance_number, platform)
             elif action == "get_date":
-                self.app.browser.open_firefox_instance(instance_number, login=False)
-                self.app.browser.get_date(instance_number)
-                self.set_run_status(instance_number, "Done", SUCCESS)
+                self.check_live_instance(instance_number, platform)
             elif action == "upload_photo_cover":
                 self.app.browser.open_firefox_instance(instance_number, login=False)
                 photo_path = self.state.photo_upload_paths.get(instance_number, "")
@@ -432,9 +707,11 @@ class InstanceManager:
     def start_all_instances(self) -> None:
         if self.state.batch_running:
             return
-        instance_numbers = self.active_instance_numbers()
+        selected_type = self._selected_account_type_from_app()
+        instance_numbers = self.active_instance_numbers_for_type(selected_type)
         if not instance_numbers:
-            self.app.messagebox.showwarning("Start All", "No active Firefox profiles found.")
+            suffix = f" for {selected_type}" if selected_type else ""
+            self.app.messagebox.showwarning("Start All", f"No active Firefox profiles found{suffix}.")
             return
 
         try:
@@ -457,6 +734,1060 @@ class InstanceManager:
         for instance_number in self.active_instance_numbers():
             if not self.is_instance_busy(instance_number):
                 self.set_run_status(instance_number, "Stopped", WARNING)
+
+    def check_live_all_instances(self, show_empty_warning: bool = True, account_type: str | None = None) -> None:
+        if self.state.batch_running:
+            return
+        selected_type = (account_type or self._selected_account_type_from_app()).strip()
+        if not selected_type:
+            if show_empty_warning:
+                self.app.messagebox.showwarning("Check Live", "Select one account type first. Check Live does not run on All.")
+            return
+        instance_numbers = self.active_instance_numbers_for_type(selected_type)
+        if not instance_numbers:
+            if show_empty_warning:
+                suffix = f" in account type {selected_type}" if selected_type else ""
+                self.app.messagebox.showwarning("Check Live", f"No active Firefox profiles found{suffix} for this platform.")
+            return
+
+        try:
+            max_workers = int(self.vars.thread_count_var.get())
+        except Exception:
+            max_workers = 3
+        max_workers = max(1, min(3, max_workers))
+        self.vars.thread_count_var.set(max_workers)
+
+        self.state.batch_running = True
+        self.state.batch_stop_requested = False
+        threading.Thread(
+            target=self._check_live_batch,
+            args=(instance_numbers, max_workers, self.vars.platform_var.get()),
+            daemon=True,
+        ).start()
+
+    def _check_live_batch(self, instance_numbers: list[int], max_workers: int, platform: str) -> None:
+        work_queue: queue.Queue[int] = queue.Queue()
+        for instance_number in instance_numbers:
+            if self._apply_live_check_preflight_result(instance_number, platform):
+                continue
+            self._queue_live_check_result(instance_number)
+            work_queue.put(instance_number)
+
+        worker_count = min(max_workers, work_queue.qsize())
+        threads: list[threading.Thread] = []
+
+        def worker() -> None:
+            while not self.state.batch_stop_requested:
+                try:
+                    instance_number = work_queue.get_nowait()
+                except queue.Empty:
+                    return
+                try:
+                    if self.state.batch_stop_requested:
+                        self.set_run_status(instance_number, "Stopped", WARNING)
+                        return
+                    self.check_live_instance(instance_number, platform)
+                    time.sleep(0.2)
+                finally:
+                    work_queue.task_done()
+
+        try:
+            if hasattr(self.app, "refresh_report_table_async"):
+                self.app.refresh_report_table_async()
+            if work_queue.empty():
+                return
+            for _index in range(worker_count):
+                if self.state.batch_stop_requested:
+                    break
+                thread = threading.Thread(target=worker, daemon=True)
+                threads.append(thread)
+                thread.start()
+            for thread in threads:
+                thread.join()
+        finally:
+            self.state.batch_running = False
+            self.state.batch_stop_requested = False
+            self.save_instance_data()
+            self.app.refresh_dashboard()
+
+    def _queue_live_check_result(self, instance_number: int) -> None:
+        report = self._ensure_instance_report(instance_number)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        report["last_action"] = "Check Live"
+        report["last_status"] = "Queued"
+        report["last_note"] = "Waiting for check worker..."
+        report["account_status"] = "Queued"
+        report["account_reason"] = "Waiting for check worker..."
+        report["account_checked_at"] = now
+        report["last_updated"] = now
+
+    def _apply_live_check_preflight_result(self, instance_number: int, platform: str) -> bool:
+        country_guard_result = self._live_check_country_guard_result(instance_number)
+        if country_guard_result:
+            self._record_live_check_result(instance_number, *country_guard_result)
+            return True
+
+        cookies = self._load_session_cookies(instance_number, platform)
+        browser_result = self._classify_running_browser_session(instance_number, platform)
+        if not cookies:
+            if browser_result:
+                self._record_live_check_result(instance_number, *browser_result)
+            else:
+                self._record_live_check_result(
+                    instance_number,
+                    "Unknown",
+                    WARNING,
+                    "No saved cookies found; open/login this profile first, then run Check Live.",
+                )
+            return True
+        if not self._has_required_login_cookie(platform, cookies):
+            if browser_result and browser_result[0] in {"Disabled", "Checkpoint", "Live"}:
+                self._record_live_check_result(instance_number, *browser_result)
+            else:
+                self._record_live_check_result(
+                    instance_number,
+                    "Login required",
+                    DANGER,
+                    f"{self._platform_label(platform)} login cookie was not found.",
+                )
+            return True
+        return False
+
+    def _live_check_country_guard_result(self, instance_number: int) -> tuple[str, str, str] | None:
+        report = self._ensure_instance_report(instance_number)
+        proxy_url = self._normalized_proxy_url(str(report.get("proxy", "") or ""))
+        if proxy_url == "unsupported":
+            return "Review", "Saved proxy uses an unsupported scheme for background check.", WARNING
+
+        opener = self._build_background_opener(proxy_url)
+        self._autofill_route_ip_country(instance_number, opener)
+        report = self._ensure_instance_report(instance_number)
+        expected_country = self.expected_country_for_instance(instance_number)
+        current_country = str(report.get("country") or "").strip()
+        if not expected_country:
+            return None
+        if current_country and not self._countries_match(current_country, expected_country):
+            account_type = str(report.get("account_type") or expected_country).strip()
+            return (
+                "IP Mismatch",
+                (
+                    f"{account_type} account expects {expected_country} IP, "
+                    f"but current IP country is {current_country}. "
+                    "Stopped before live check; cookies were not loaded."
+                ),
+                DANGER,
+            )
+        if not current_country:
+            return (
+                "IP unknown",
+                f"Could not verify current IP country before checking {expected_country} account.",
+                WARNING,
+            )
+        return None
+
+    def check_live_instance(self, instance_number: int, platform: str | None = None) -> None:
+        platform = platform or self.vars.platform_var.get()
+        self._begin_live_check_result(instance_number)
+        self.set_run_status(instance_number, "Checking", WARNING)
+        status, note, color = self._check_live_instance_background(instance_number, platform)
+        self._record_live_check_result(instance_number, status, color, note)
+
+    def _begin_live_check_result(self, instance_number: int) -> None:
+        report = self._ensure_instance_report(instance_number)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        report["last_action"] = "Check Live"
+        report["last_status"] = "Checking"
+        report["last_note"] = "Checking account session..."
+        report["account_status"] = "Checking"
+        report["account_reason"] = "Checking account session..."
+        report["account_checked_at"] = now
+        report["last_updated"] = now
+        if hasattr(self.app, "refresh_report_table_async"):
+            self.app.refresh_report_table_async()
+
+    def _sync_identity_from_open_browser(self, instance_number: int) -> None:
+        driver = self.state.drivers.get(instance_number)
+        if not driver:
+            return
+        try:
+            self.app.browser._sync_profile_identity_from_current_page(instance_number, driver)
+        except Exception:
+            logging.debug("Open browser identity sync skipped for Firefox %s.", instance_number)
+
+    def sync_open_browser_pages(self) -> bool:
+        changed = False
+        for instance_number, driver in list(self.state.drivers.items()):
+            if instance_number in self.state.deleted_instances:
+                continue
+            try:
+                before_name = self.state.profile_names.get(instance_number, "")
+                before_report = dict(self.state.instance_reports.get(instance_number, {}))
+                self.app.browser._sync_profile_identity_from_current_page(instance_number, driver)
+                after_report = self.state.instance_reports.get(instance_number, {})
+                if before_name != self.state.profile_names.get(instance_number, "") or before_report != after_report:
+                    changed = True
+            except Exception:
+                logging.debug("Open browser page sync failed for Firefox %s.", instance_number)
+        return changed
+
+    def _check_live_instance_background(self, instance_number: int, platform: str) -> tuple[str, str, str]:
+        report = self._ensure_instance_report(instance_number)
+        proxy_url = self._normalized_proxy_url(str(report.get("proxy", "") or ""))
+        if proxy_url == "unsupported":
+            return "Review", "Saved proxy uses an unsupported scheme for background check.", WARNING
+        opener = self._build_background_opener(proxy_url)
+        self._autofill_route_ip_country(instance_number, opener)
+        report = self._ensure_instance_report(instance_number)
+        expected_country = self.expected_country_for_instance(instance_number)
+        current_country = str(report.get("country") or "").strip()
+        if expected_country:
+            if current_country and not self._countries_match(current_country, expected_country):
+                account_type = str(report.get("account_type") or expected_country).strip()
+                return (
+                    "IP Mismatch",
+                    (
+                        f"{account_type} account expects {expected_country} IP, "
+                        f"but current IP country is {current_country}. "
+                        "Stopped before live check; cookies were not loaded."
+                    ),
+                    DANGER,
+                )
+            if not current_country:
+                return (
+                    "IP unknown",
+                    f"Could not verify current IP country before checking {expected_country} account.",
+                    WARNING,
+                )
+
+        cookies = self._load_session_cookies(instance_number, platform)
+        if not cookies:
+            browser_result = self._classify_running_browser_session(instance_number, platform)
+            if browser_result:
+                return browser_result
+            return "Unknown", "No saved cookies found; open/login this profile first, then run Check Live.", WARNING
+
+        if not self._has_required_login_cookie(platform, cookies):
+            browser_result = self._classify_running_browser_session(instance_number, platform)
+            if browser_result and browser_result[0] in {"Disabled", "Checkpoint", "Live"}:
+                return browser_result
+            return "Login required", f"{self._platform_label(platform)} login cookie was not found.", DANGER
+
+        url = self.PLATFORM_CHECK_URLS.get(platform, self.PLATFORM_HOME_URLS.get(platform, "https://www.google.com"))
+        if platform == "facebook" and str(cookies.get("c_user") or "").strip().isdigit():
+            if not str(report.get("account_id") or "").strip():
+                report["account_id"] = str(cookies["c_user"]).strip()
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cookie": self._cookie_header(cookies),
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) "
+                "Gecko/20100101 Firefox/126.0"
+            ),
+        }
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            with opener.open(request, timeout=20) as response:
+                final_url = str(response.geturl() or "")
+                status_code = int(getattr(response, "status", 0) or response.getcode() or 0)
+                body = response.read(600000).decode("utf-8", errors="ignore")
+                self._autofill_identity_from_background_body(instance_number, body)
+                if platform == "facebook":
+                    self._autofill_facebook_details_background(instance_number, opener, headers, cookies)
+                    self._autofill_facebook_details_headless_if_needed(instance_number, cookies)
+        except urllib.error.HTTPError as exc:
+            final_url = str(exc.geturl() or url)
+            status_code = int(exc.code or 0)
+            try:
+                body = exc.read(300000).decode("utf-8", errors="ignore")
+                self._autofill_identity_from_background_body(instance_number, body)
+                if platform == "facebook":
+                    self._autofill_facebook_details_background(instance_number, opener, headers, cookies)
+                    self._autofill_facebook_details_headless_if_needed(instance_number, cookies)
+            except Exception:
+                body = ""
+        except Exception as exc:
+            return "Check error", f"Background check failed: {exc}", DANGER
+
+        return self._classify_http_session(platform, final_url, status_code, body, cookies)
+
+    def _autofill_facebook_details_background(
+        self,
+        instance_number: int,
+        opener,
+        headers: dict[str, str],
+        cookies: dict[str, str],
+    ) -> None:
+        report = self._ensure_instance_report(instance_number)
+        account_id = str(report.get("account_id") or cookies.get("c_user") or "").strip()
+        detail_urls = [
+            "https://accountscenter.facebook.com/?entry_point=app_settings",
+            "https://accountscenter.facebook.com/profiles",
+            "https://accountscenter.facebook.com/personal_info",
+            "https://accountscenter.facebook.com/personal_info/contact_points",
+            "https://accountscenter.facebook.com/personal_info/contact_points/",
+        ]
+        if account_id.isdigit():
+            detail_urls.extend(
+                [
+                    f"https://www.facebook.com/profile.php?id={account_id}&sk=directory_personal_details",
+                    f"https://www.facebook.com/profile.php?id={account_id}&sk=about_contact_and_basic_info",
+                    f"https://m.facebook.com/profile.php?id={account_id}&v=info",
+                ]
+            )
+        for detail_url in detail_urls:
+            try:
+                request = urllib.request.Request(detail_url, headers=headers)
+                with opener.open(request, timeout=20) as response:
+                    body = response.read(800000).decode("utf-8", errors="ignore")
+                self._autofill_identity_from_background_body(instance_number, body)
+            except Exception:
+                continue
+
+    def _autofill_facebook_details_headless_if_needed(self, instance_number: int, cookies: dict[str, str]) -> None:
+        report = self._ensure_instance_report(instance_number)
+        needs_email = not self._has_report_value(report.get("gmail"))
+        needs_birth = not self._has_report_value(report.get("date_birth"))
+        needs_gender = not self._has_report_value(report.get("gender"))
+        if not (needs_email or needs_birth or needs_gender):
+            return
+        if not cookies or not self._has_required_login_cookie("facebook", cookies):
+            return
+
+        driver = None
+        try:
+            options = FirefoxOptions()
+            options.add_argument("-headless")
+            options.set_preference(
+                "general.useragent.override",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+            )
+            options.set_preference("permissions.default.image", 2)
+            service = FirefoxService(executable_path=str(GECKODRIVER_PATH))
+            driver = webdriver.Firefox(service=service, options=options)
+            driver.set_page_load_timeout(35)
+            driver.get("https://www.facebook.com/")
+            self._add_facebook_cookies_to_driver(driver, cookies)
+
+            detail_urls = (
+                "https://accountscenter.facebook.com/?entry_point=app_settings",
+                "https://accountscenter.facebook.com/personal_info",
+                "https://accountscenter.facebook.com/personal_info/contact_points",
+                "https://accountscenter.facebook.com/personal_info/profile_info",
+                "https://accountscenter.facebook.com/personal_info/gender",
+                "https://www.facebook.com/me/about_contact_and_basic_info",
+            )
+            for detail_url in detail_urls:
+                try:
+                    driver.get(detail_url)
+                    body_text = self._wait_for_rendered_accounts_center_text(driver)
+                    page_source = str(driver.page_source or "")
+                    if self._autofill_identity_from_rendered_text(instance_number, body_text, page_source):
+                        report = self._ensure_instance_report(instance_number)
+                        if (
+                            self._has_report_value(report.get("gmail"))
+                            and self._has_report_value(report.get("date_birth"))
+                            and self._has_report_value(report.get("gender"))
+                        ):
+                            return
+                except Exception:
+                    continue
+        except Exception as exc:
+            logging.debug("Headless Accounts Center detail check failed for Firefox %s: %s", instance_number, exc)
+        finally:
+            if driver is not None:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+
+    def _add_facebook_cookies_to_driver(self, driver, cookies: dict[str, str]) -> None:
+        for name, value in cookies.items():
+            clean_name = str(name or "").strip()
+            clean_value = str(value or "").strip()
+            if not clean_name or not clean_value:
+                continue
+            cookie_data = {
+                "name": clean_name,
+                "value": clean_value,
+                "path": "/",
+                "secure": True,
+            }
+            if not clean_name.startswith("__Host-"):
+                cookie_data["domain"] = ".facebook.com"
+            try:
+                driver.add_cookie(cookie_data)
+            except Exception:
+                try:
+                    cookie_data.pop("domain", None)
+                    driver.add_cookie(cookie_data)
+                except Exception:
+                    continue
+
+    def _wait_for_rendered_accounts_center_text(self, driver) -> str:
+        body_text = ""
+        for _attempt in range(12):
+            try:
+                body_text = str(driver.execute_script("return document.body ? document.body.innerText : '';") or "")
+            except Exception:
+                body_text = ""
+            if (
+                "Contact info" in body_text
+                or "Birthday" in body_text
+                or "Gender" in body_text
+                or "Profiles and personal details" in body_text
+            ):
+                return body_text
+            time.sleep(0.5)
+        return body_text
+
+    def _autofill_identity_from_rendered_text(self, instance_number: int, body_text: str, page_source: str = "") -> bool:
+        if not body_text and not page_source:
+            return False
+        profile_name = ""
+        date_birth = ""
+        gmail = ""
+        gender = ""
+        try:
+            profile_name, date_birth, gmail = self.app.browser._extract_accounts_center_identity_from_visible_text(body_text)
+            gender = self.app.browser._extract_gender_from_visible_text(body_text)
+        except Exception:
+            pass
+        if not gmail:
+            gmail = self._extract_email_from_text_or_source("\n".join([body_text or "", page_source or ""]))
+        if not date_birth:
+            date_birth = self._extract_birthdate_from_text_or_source("\n".join([body_text or "", page_source or ""]))
+        if not gender:
+            gender = self._extract_gender_from_text_or_source(page_source or body_text, body_text)
+
+        changed = False
+        if profile_name and self.state.profile_names.get(instance_number) != profile_name:
+            self.state.profile_names[instance_number] = profile_name
+            changed = True
+        before = dict(self._ensure_instance_report(instance_number))
+        if gender or gmail or date_birth:
+            self.set_profile_identity(
+                instance_number,
+                date_birth=date_birth,
+                gender=gender,
+                gmail=gmail,
+                save_data=False,
+                refresh_table=False,
+            )
+        after = self._ensure_instance_report(instance_number)
+        return changed or before != after
+
+    def _build_background_opener(self, proxy_url: str):
+        handlers = []
+        if proxy_url:
+            handlers.append(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
+        handlers.append(urllib.request.HTTPRedirectHandler())
+        return urllib.request.build_opener(*handlers)
+
+    def _autofill_route_ip_country(self, instance_number: int, opener) -> None:
+        ip_address, country = self._lookup_route_ip_country(opener=opener)
+        if ip_address or country:
+            self.set_network_identity(
+                instance_number,
+                ip_address=ip_address,
+                country=country,
+                save_data=False,
+                refresh_table=False,
+            )
+
+    def _lookup_route_ip_country(self, proxy_url: str = "", opener=None) -> tuple[str, str]:
+        cache_key = str(proxy_url or "__direct__")
+        now = time.time()
+        cached = self._route_identity_cache.get(cache_key)
+        if cached and now - cached[0] < 60:
+            return cached[1], cached[2]
+        if opener is None:
+            opener = self._build_background_opener(proxy_url)
+        endpoints = (
+            "https://ipwho.is/",
+            "https://ipapi.co/json/",
+        )
+        for endpoint in endpoints:
+            try:
+                request = urllib.request.Request(
+                    endpoint,
+                    headers={
+                        "Accept": "application/json",
+                        "User-Agent": "Mozilla/5.0",
+                    },
+                )
+                with opener.open(request, timeout=12) as response:
+                    payload = json.loads(response.read().decode("utf-8", errors="ignore") or "{}")
+                ip_address = str(payload.get("ip") or "").strip()
+                country = str(
+                    payload.get("country")
+                    or payload.get("country_name")
+                    or payload.get("country_code")
+                    or ""
+                ).strip()
+                if ip_address or country:
+                    self._route_identity_cache[cache_key] = (now, ip_address, country)
+                    return ip_address, country
+            except Exception:
+                continue
+        return "", ""
+
+    def allow_open_for_expected_country(self, instance_number: int) -> bool:
+        expected_country = self.expected_country_for_instance(instance_number)
+        if not expected_country:
+            return True
+        report = self._ensure_instance_report(instance_number)
+        proxy_url = self._normalized_proxy_url(str(report.get("proxy", "") or ""))
+        cache_key = str(proxy_url or "__direct__")
+        if proxy_url == "unsupported":
+            current_country = ""
+            ip_address = ""
+        else:
+            ip_address, current_country = self._lookup_route_ip_country(proxy_url=proxy_url)
+        # Strict country match only. The IP number may change, but the country must stay expected.
+        if current_country and self._countries_match(current_country, expected_country):
+            if ip_address or current_country:
+                self.set_network_identity(
+                    instance_number,
+                    ip_address=ip_address,
+                    country=current_country,
+                    save_data=True,
+                    refresh_table=True,
+                )
+            return True
+        self._route_identity_cache.pop(cache_key, None)
+        account_type = str(report.get("account_type") or expected_country).strip()
+        self._warn_country_mismatch(account_type, expected_country, current_country)
+        self.set_run_status(instance_number, "IP mismatch", DANGER)
+        return False
+
+    def expected_country_for_instance(self, instance_number: int) -> str:
+        report = self._ensure_instance_report(instance_number)
+        expected = str(report.get("expected_country") or "").strip()
+        if expected:
+            return expected
+        account_type = str(report.get("account_type") or "").strip()
+        if account_type:
+            expected = self._expected_country_from_account_type(account_type)
+            if expected:
+                report["expected_country"] = expected
+                return expected
+        return ""
+
+    def _expected_country_from_account_type(self, account_type: str) -> str:
+        value = str(account_type or "").strip()
+        normalized = self._country_compare_key(value)
+        # This is not a fixed country list. It only expands common aliases;
+        # every other account type is kept as the operator-entered country name.
+        if normalized == "cambodia":
+            return "Cambodia"
+        if normalized == "united states":
+            return "United States"
+        if normalized == "canada":
+            return "Canada"
+        return value
+
+    def _countries_match(self, current_country: str, expected_country: str) -> bool:
+        current_key = self._country_compare_key(current_country)
+        expected_key = self._country_compare_key(expected_country)
+        return bool(current_key and expected_key and current_key == expected_key)
+
+    def _country_compare_key(self, country: str) -> str:
+        value = re.sub(r"[^a-z]+", " ", str(country or "").strip().lower())
+        value = " ".join(value.split())
+        # Aliases are convenience names only. Any country/account type not listed here
+        # still works because the normalized text is compared directly.
+        aliases = {
+            "khmer": "cambodia",
+            "cambodian": "cambodia",
+            "kampuchea": "cambodia",
+            "kh": "cambodia",
+            "ca": "canada",
+            "usa": "united states",
+            "us": "united states",
+            "u s": "united states",
+            "u s a": "united states",
+            "america": "united states",
+            "united states of america": "united states",
+            "uk": "united kingdom",
+            "gb": "united kingdom",
+            "great britain": "united kingdom",
+        }
+        return aliases.get(value, value)
+
+    def _warn_country_mismatch(self, account_type: str, expected_country: str, current_country: str) -> None:
+        account_label = str(account_type or expected_country or "This").strip()
+        current = str(current_country or "").strip()
+        if current:
+            message = (
+                f"{account_label} account expects {expected_country} IP, "
+                f"but your current IP country is {current}.\n"
+                f"Please change VPN/proxy to {expected_country} before opening this account."
+            )
+        else:
+            message = (
+                f"{account_label} account expects {expected_country} IP, "
+                "but your current IP country could not be checked.\n"
+                f"Please change VPN/proxy to {expected_country} before opening this account."
+            )
+        try:
+            self.app.root.after(0, lambda: self.app.messagebox.showwarning("VPN/Proxy Country Mismatch", message))
+        except Exception:
+            self.app.messagebox.showwarning("VPN/Proxy Country Mismatch", message)
+
+    def _autofill_identity_from_background_body(self, instance_number: int, body: str) -> None:
+        if not body:
+            return
+        report = self._ensure_instance_report(instance_number)
+        profile_name = self._extract_profile_name_from_text_or_source(body)
+        gender = self._extract_gender_from_text_or_source(body, body)
+        gmail = self._extract_email_from_text_or_source(body)
+        date_birth = self._extract_birthdate_from_text_or_source(body)
+        if profile_name and self.state.profile_names.get(instance_number) != profile_name:
+            self.state.profile_names[instance_number] = profile_name
+        if gender or gmail or date_birth:
+            self.set_profile_identity(
+                instance_number,
+                date_birth=date_birth,
+                gender=gender,
+                gmail=gmail,
+                save_data=False,
+                refresh_table=False,
+            )
+
+    def _extract_profile_name_from_text_or_source(self, source: str) -> str:
+        text = self._plain_text_from_source(source)
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        for index, line in enumerate(lines):
+            if line.lower() != "profiles":
+                continue
+            for candidate in lines[index + 1 : index + 10]:
+                if self._looks_generic_profile_text(candidate):
+                    continue
+                if "@" in candidate:
+                    continue
+                return candidate
+        source_text = self._decode_web_text(source)
+        patterns = (
+            r'"profile_name"\s*:\s*"([^"]{2,120})"',
+            r'"full_name"\s*:\s*"([^"]{2,120})"',
+            r'"name"\s*:\s*"([^"]{2,120})"',
+        )
+        for pattern in patterns:
+            for match in re.findall(pattern, source_text, flags=re.IGNORECASE):
+                candidate = str(match or "").strip()
+                if candidate and not self._looks_generic_profile_text(candidate) and "@" not in candidate:
+                    return candidate
+        return ""
+
+    def _looks_generic_profile_text(self, value: str) -> bool:
+        normalized = re.sub(r"\s+", " ", str(value or "").strip()).lower()
+        if not normalized:
+            return True
+        return normalized in {
+            "facebook",
+            "profiles",
+            "profile",
+            "personal details",
+            "profiles and personal details",
+            "add accounts",
+            "accounts center",
+            "meta",
+            "account settings",
+            "contact info",
+            "birthday",
+            "manage accounts",
+        }
+
+    def _has_report_value(self, value: object) -> bool:
+        text = str(value or "").strip()
+        return bool(text and text not in {"-", "No Gmail"})
+
+    def _extract_gender_from_text_or_source(self, source: str, body_text: str = "") -> str:
+        source_text = urllib.parse.unquote(self._decode_web_text(source))
+        gender_json_patterns = (
+            r'"gender"\s*:\s*"([A-Za-z_ ]+)"',
+            r'"gender_label"\s*:\s*"([A-Za-z_ ]+)"',
+            r'"gender_display"\s*:\s*"([A-Za-z_ ]+)"',
+            r'"selected_gender"\s*:\s*"([A-Za-z_ ]+)"',
+        )
+        for pattern in gender_json_patterns:
+            gender_json = re.search(pattern, source_text, flags=re.IGNORECASE)
+            if gender_json:
+                gender = self._normalize_gender(gender_json.group(1))
+                if gender in {"Female", "Male", "Custom"}:
+                    return gender
+        text = self._plain_text_from_source(body_text or source)
+        patterns = (
+            r"\bGender\s+(Female|Male|Custom)\b",
+            r"\b(Female|Male|Custom)\s+Gender\b",
+            r"\bGender\s*\n\s*(Female|Male|Custom)\b",
+            r"\b(Female|Male|Custom)\s*\n\s*Gender\b",
+            r"\bGender\s*[:\-]\s*(Female|Male|Custom)\b",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                for group in match.groups():
+                    gender = self._normalize_gender(group)
+                    if gender in {"Female", "Male", "Custom"}:
+                        return gender
+        return ""
+
+    def _extract_birthdate_from_text_or_source(self, source: str) -> str:
+        source_text = self._decode_web_text(source)
+        birth_json = re.search(
+            r'"birthdate"\s*:\s*\{\s*"day"\s*:\s*(\d{1,2})\s*,\s*"month"\s*:\s*(\d{1,2})\s*,\s*"year"\s*:\s*(\d{4})',
+            source_text,
+        )
+        if birth_json:
+            day, month, year = birth_json.group(1), birth_json.group(2), birth_json.group(3)
+            return f"{year}-{int(month):02d}-{int(day):02d}"
+        return ""
+
+    def _extract_email_from_text_or_source(self, source: str) -> str:
+        source_text = urllib.parse.unquote(self._decode_web_text(source))
+        plain_text = self._plain_text_from_source(source_text)
+        email_pattern = r"([A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})"
+        candidates = []
+        source_patterns = (
+            r'"(?:primary_)?email"\s*:\s*"([^"]+@[^"]+)"',
+            r'"(?:normalized_)?email_address"\s*:\s*"([^"]+@[^"]+)"',
+            r'"contact(?:_point)?"\s*:\s*"([^"]+@[^"]+)"',
+            r'"display_value"\s*:\s*"([^"]+@[^"]+)"',
+            r'"subtitle"\s*:\s*"([^"]+@[^"]+)"',
+        )
+        for pattern in source_patterns:
+            for match in re.findall(pattern, source_text, flags=re.IGNORECASE):
+                candidates.append(str(match or "").strip())
+        for match in re.findall(email_pattern, source_text):
+            candidates.append(str(match or "").strip())
+        text_patterns = (
+            r"Contact info\s*\n\s*([^\n]+@[^\n]+)",
+            r"Email(?: address)?\s*\n\s*([^\n]+@[^\n]+)",
+        )
+        for pattern in text_patterns:
+            for match in re.findall(pattern, plain_text, flags=re.IGNORECASE):
+                candidates.append(str(match or "").strip())
+        valid = []
+        for candidate in candidates:
+            clean = str(candidate or "").strip().replace("\\", "")
+            clean = re.sub(r"^[\"'(<\[]+|[\"'),<>\].;:]+$", "", clean)
+            clean = re.sub(r"[,\s]+$", "", clean)
+            lower = clean.lower()
+            if not re.match(rf"^{email_pattern}$", clean):
+                continue
+            if any(skip in lower for skip in ("facebookmail.com", "@facebook.com", "noreply", "notification")):
+                continue
+            if clean not in valid:
+                valid.append(clean)
+        if not valid:
+            return ""
+
+        def candidate_score(value: str) -> int:
+            local, _, domain = value.partition("@")
+            score = len(local)
+            if "+" in local:
+                score += 4
+            if "#" in local:
+                score += 4
+            if domain.lower() == "gmail.com":
+                score += 2
+            return score
+
+        gmail_values = [value for value in valid if value.lower().endswith("@gmail.com")]
+        if gmail_values:
+            return max(gmail_values, key=candidate_score)
+        return max(valid, key=candidate_score)
+
+    def _decode_web_text(self, value: object) -> str:
+        text = unescape(str(value or "")).replace("\\/", "/")
+        text = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), text)
+        return text.replace('\\"', '"')
+
+    def _plain_text_from_source(self, value: object) -> str:
+        text = self._decode_web_text(value)
+        text = re.sub(r"(?is)<(script|style).*?</\1>", "\n", text)
+        text = re.sub(r"(?is)<[^>]+>", "\n", text)
+        text = re.sub(r"[ \t\r\f\v]+", " ", text)
+        text = re.sub(r"\n+", "\n", text)
+        return text
+
+    def _normalize_gender(self, value: str) -> str:
+        raw = str(value or "").strip().replace("_", " ").lower()
+        if not raw:
+            return ""
+        if "female" in raw:
+            return "Female"
+        if "male" in raw:
+            return "Male"
+        return raw.title()
+
+    def _normalized_proxy_url(self, proxy: str) -> str:
+        value = str(proxy or "").strip()
+        if not value:
+            return ""
+        lower = value.lower()
+        if lower.startswith(("socks://", "socks4://", "socks5://")):
+            return "unsupported"
+        if "://" not in value:
+            return f"http://{value}"
+        if lower.startswith(("http://", "https://")):
+            return value
+        return "unsupported"
+
+    def _proxy_host(self, proxy: str) -> str:
+        value = str(proxy or "").strip()
+        if not value:
+            return ""
+        value = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", "", value)
+        if "@" in value:
+            value = value.rsplit("@", 1)[1]
+        return value.split(":", 1)[0].strip()
+
+    def _has_required_login_cookie(self, platform: str, cookies: dict[str, str]) -> bool:
+        if platform == "facebook":
+            return bool(str(cookies.get("c_user") or "").strip().isdigit())
+        if platform == "tiktok":
+            return any(name in cookies for name in ("sessionid", "sessionid_ss", "sid_guard"))
+        if platform == "youtube":
+            return any(name in cookies for name in ("SAPISID", "__Secure-1PSID", "__Secure-3PSID", "SID", "HSID", "SSID", "APISID"))
+        if platform == "instagram":
+            return "sessionid" in cookies
+        return bool(cookies)
+
+    def _load_session_cookies(self, instance_number: int, platform: str) -> dict[str, str]:
+        cookies: dict[str, str] = {}
+        cookies.update(self._load_json_cookie_file(instance_number, platform))
+        cookies.update(self._load_firefox_sqlite_cookies(instance_number, platform))
+        return {name: value for name, value in cookies.items() if name and value}
+
+    def _load_json_cookie_file(self, instance_number: int, platform: str) -> dict[str, str]:
+        cookie_path = self._cookie_file_for_platform(instance_number, platform)
+        if not cookie_path.exists():
+            return {}
+        try:
+            with cookie_path.open("r", encoding="utf-8") as handle:
+                raw_cookies = json.load(handle)
+        except Exception:
+            return {}
+        output: dict[str, str] = {}
+        for cookie in raw_cookies if isinstance(raw_cookies, list) else []:
+            name = str(cookie.get("name", "") or "").strip()
+            value = str(cookie.get("value", "") or "").strip()
+            if name and value:
+                output[name] = value
+        return output
+
+    def _load_firefox_sqlite_cookies(self, instance_number: int, platform: str) -> dict[str, str]:
+        cookie_db = self.firefox_profile_dir(instance_number, platform) / "cookies.sqlite"
+        if not cookie_db.exists():
+            return {}
+        domains = {
+            "facebook": ("facebook.com",),
+            "tiktok": ("tiktok.com",),
+            "youtube": ("youtube.com", "google.com"),
+            "instagram": ("instagram.com",),
+        }.get(platform, ())
+        output: dict[str, str] = {}
+        try:
+            conn = sqlite3.connect(f"file:{cookie_db}?mode=ro", uri=True, timeout=1)
+            try:
+                rows = conn.execute("SELECT host, name, value FROM moz_cookies").fetchall()
+            finally:
+                conn.close()
+        except Exception:
+            return {}
+        for host, name, value in rows:
+            host_text = str(host or "").lower()
+            if domains and not any(domain in host_text for domain in domains):
+                continue
+            name_text = str(name or "").strip()
+            value_text = str(value or "").strip()
+            if name_text and value_text:
+                output[name_text] = value_text
+        return output
+
+    def _cookie_file_for_platform(self, instance_number: int, platform: str):
+        return cookie_dir_for_platform(platform) / f"cookies_{instance_number}.json"
+
+    def _cookie_header(self, cookies: dict[str, str]) -> str:
+        return "; ".join(f"{name}={value}" for name, value in cookies.items())
+
+    def _classify_http_session(
+        self,
+        platform: str,
+        final_url: str,
+        status_code: int,
+        body: str,
+        cookies: dict[str, str],
+    ) -> tuple[str, str, str]:
+        current_url = final_url.lower()
+        text = body.lower()
+        if status_code in {401, 403}:
+            return "Review", f"Background check returned HTTP {status_code}; review this account/session.", WARNING
+        disabled_markers = (
+            "checkpoint/disabled",
+            "account disabled",
+            "account has been disabled",
+            "your account was disabled",
+            "your account has been suspended",
+            "account suspended",
+            "account permanently disabled",
+            "we disabled your account",
+            "no longer request a review",
+        )
+        if any(marker in current_url or marker in text for marker in disabled_markers):
+            return "Disabled", "Platform reports the account/session is disabled or suspended.", DANGER
+        if any(marker in current_url or marker in text for marker in ("checkpoint", "challenge", "verify your identity", "suspicious activity")):
+            return "Checkpoint", "Platform is asking for verification/checkpoint.", DANGER
+
+        if platform == "facebook":
+            if "c_user" not in cookies:
+                return "Login required", "Facebook c_user session cookie was not found.", DANGER
+            login_markers = ('name="email"', 'id="email"', 'data-testid="royal_email"', 'name="pass"', "facebook.com/login")
+            if any(marker in current_url or marker in text for marker in login_markers):
+                return "Login required", "Facebook returned a login page for this saved session.", DANGER
+            return "Live", "Background cookie check reached Facebook without login/checkpoint screen.", SUCCESS
+
+        if platform == "tiktok":
+            if "login" in current_url or "login to tiktok" in text:
+                return "Login required", "TikTok returned a login page for this saved session.", DANGER
+            return "Live", "Background cookie check reached TikTok without login/challenge screen.", SUCCESS
+
+        if platform == "youtube":
+            if "accounts.google.com" in current_url or "signin" in current_url:
+                return "Login required", "YouTube/Google returned a sign-in page for this saved session.", DANGER
+            return "Live", "Background cookie check reached YouTube without sign-in/challenge screen.", SUCCESS
+
+        if platform == "instagram":
+            if "accounts/login" in current_url or "login" in current_url:
+                return "Login required", "Instagram returned a login page for this saved session.", DANGER
+            return "Live", "Background cookie check reached Instagram without login/challenge screen.", SUCCESS
+
+        return "Review", "Could not confidently classify this account from the background response.", WARNING
+
+    def _record_live_check_result(self, instance_number: int, status: str, color: str, note: str) -> None:
+        report = self._ensure_instance_report(instance_number)
+        if str(status or "").strip().lower() in {"ip mismatch", "ip unknown"}:
+            report["last_action"] = "Stop"
+        else:
+            report["last_action"] = "Check Live"
+        if str(status or "").strip().lower() == "live" and not self._has_report_value(report.get("gmail")):
+            report["gmail"] = "No Gmail"
+        report["last_status"] = status
+        report["last_note"] = note
+        report["account_status"] = status
+        report["account_reason"] = note
+        report["account_checked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if status == "Live":
+            report["success_count"] = int(report.get("success_count", 0)) + 1
+        elif status != "Checking":
+            report["fail_count"] = int(report.get("fail_count", 0)) + 1
+        self.set_run_status(instance_number, status, color, persist_report=False)
+
+    def _classify_platform_session(self, driver, platform: str) -> tuple[str, str, str]:
+        try:
+            current_url = str(driver.current_url or "").lower()
+            title = str(driver.title or "").lower()
+            body = str(driver.page_source or "").lower()[:500000]
+        except Exception as exc:
+            return "Check error", f"Could not read page: {exc}", DANGER
+
+        disabled_markers = (
+            "checkpoint/disabled",
+            "account disabled",
+            "account has been disabled",
+            "your account was disabled",
+            "your account has been suspended",
+            "account suspended",
+            "account permanently disabled",
+            "violated our terms",
+            "we disabled your account",
+            "no longer request a review",
+        )
+        checkpoint_markers = (
+            "checkpoint",
+            "security check",
+            "confirm your identity",
+            "verify your identity",
+            "suspicious activity",
+            "challenge_required",
+            "challenge",
+            "verification required",
+            "unusual activity",
+        )
+        login_markers = (
+            "login",
+            "log in",
+            "sign in",
+            "signup",
+            "sign up",
+            "password",
+        )
+
+        if any(marker in current_url or marker in title or marker in body for marker in disabled_markers):
+            return "Disabled", "Platform reports the account/session is disabled or suspended.", DANGER
+        if any(marker in current_url or marker in title or marker in body for marker in checkpoint_markers):
+            return "Checkpoint", "Platform is asking for verification/checkpoint.", DANGER
+
+        if platform == "facebook":
+            has_c_user = False
+            try:
+                cookie = driver.get_cookie("c_user")
+                has_c_user = bool(cookie and str(cookie.get("value", "")).strip().isdigit())
+            except Exception:
+                has_c_user = False
+            login_form_markers = (
+                'name="email"',
+                'id="email"',
+                'data-testid="royal_email"',
+                'name="pass"',
+                'facebook helps you connect and share',
+            )
+            if "facebook.com/login" in current_url or "/checkpoint/" in current_url:
+                return "Login required", "Facebook session is not logged in or needs checkpoint.", DANGER
+            if any(marker in body for marker in login_form_markers) or not has_c_user:
+                return "Login required", "Facebook c_user session cookie was not found.", DANGER
+            if "facebook.com" in current_url and "login" not in current_url:
+                return "Live", "Facebook c_user session opened without checkpoint or disabled screen.", SUCCESS
+        elif platform == "tiktok":
+            if "login" in current_url or "login to tiktok" in body:
+                return "Login required", "TikTok session is not logged in.", DANGER
+            if "tiktok.com" in current_url:
+                return "Live", "TikTok session opened without disabled/challenge screen.", SUCCESS
+        elif platform == "youtube":
+            if "accounts.google.com" in current_url or "signin" in current_url:
+                return "Login required", "YouTube/Google session is not signed in.", DANGER
+            if "youtube.com" in current_url or "studio.youtube.com" in current_url:
+                return "Live", "YouTube session opened without disabled/challenge screen.", SUCCESS
+        elif platform == "instagram":
+            if "accounts/login" in current_url or "login" in current_url:
+                return "Login required", "Instagram session is not logged in.", DANGER
+            if "instagram.com" in current_url:
+                return "Live", "Instagram session opened without disabled/challenge screen.", SUCCESS
+
+        if any(marker in current_url or marker in title for marker in login_markers):
+            return "Login required", "Session appears logged out.", DANGER
+        return "Review", "Could not confidently classify this account; review the browser page.", WARNING
+
+    def _classify_running_browser_session(self, instance_number: int, platform: str) -> tuple[str, str, str] | None:
+        driver = self.state.drivers.get(instance_number)
+        if not driver:
+            return None
+        try:
+            status, note, color = self._classify_platform_session(driver, platform)
+        except Exception:
+            return None
+        if status in {"Disabled", "Checkpoint", "Live", "Login required"}:
+            return status, f"Open Firefox page check: {note}", color
+        return None
+
+    def _platform_label(self, platform: str) -> str:
+        for label, value in self.app.PLATFORMS:
+            if value == platform:
+                return label
+        return platform.title()
 
     def _run_batch_instances(self, instance_numbers: list[int], max_workers: int) -> None:
         semaphore = threading.Semaphore(max_workers)
@@ -496,6 +1827,133 @@ class InstanceManager:
         numbers.update(self.state.instance_reports.keys())
         return sorted(number for number in numbers if number not in self.state.deleted_instances)
 
+    def _selected_account_type_from_app(self) -> str:
+        selector = getattr(self.app, "_selected_account_type", None)
+        if callable(selector):
+            try:
+                return str(selector() or "").strip()
+            except Exception:
+                return ""
+        return ""
+
+    def report_matches_account_type(self, report: dict, account_type: str) -> bool:
+        selected = str(account_type or "").strip()
+        if not selected or selected.lower() in {"all", "store"}:
+            return True
+        selected_lower = selected.lower()
+
+        account_type_value = str(report.get("country_type") or report.get("account_type", "") or "").strip()
+        country_value = str(report.get("country", "") or "").strip()
+
+        # Country Type is the saved account/country grouping. Current country is detected
+        # from IP/proxy and can differ, so it must not mix groups.
+        values = [account_type_value] if account_type_value and account_type_value != "-" else [country_value]
+        normalized_values = {value.lower() for value in values if value and value != "-"}
+        if selected_lower in normalized_values:
+            return True
+        khmer_aliases = {"khmer", "cambodia", "cambodian", "kampuchea"}
+        if selected_lower in khmer_aliases and normalized_values.intersection(khmer_aliases):
+            return True
+        usa_aliases = {"usa", "us", "u.s.", "u.s.a.", "united states", "united states of america", "america"}
+        if selected_lower in usa_aliases and normalized_values.intersection(usa_aliases):
+            return True
+        return any(selected_lower in value for value in normalized_values)
+
+    def instance_matches_account_type(self, instance_number: int, account_type: str) -> bool:
+        report = self._ensure_instance_report(instance_number)
+        return self.report_matches_account_type(report, account_type)
+
+    def active_instance_numbers_for_type(self, account_type: str | None = None) -> list[int]:
+        self._ensure_local_indexes()
+        selected = str(account_type or "").strip()
+        numbers = self.active_instance_numbers()
+        if not selected or selected.lower() in {"all", "store"}:
+            return numbers
+        return [number for number in numbers if self.instance_matches_account_type(number, selected)]
+
+    def _next_available_instance_number(self) -> int:
+        used = set(self.active_instance_numbers())
+        used.update(self.state.deleted_instances)
+        used.update(self.state.instance_names.keys())
+        used.update(self.state.profile_names.keys())
+        used.update(self.state.run_states.keys())
+        used.update(self.state.instance_reports.keys())
+        next_number = 1
+        while next_number in used:
+            next_number += 1
+        return next_number
+
+    def _instance_number_for_local_type(self, account_type: str, local_index: int) -> int | None:
+        clean_type = str(account_type or "").strip().lower()
+        if not clean_type:
+            return None
+        for instance_number in self.active_instance_numbers():
+            report = self._ensure_instance_report(instance_number)
+            report_type = str(report.get("account_type") or report.get("country") or "").strip().lower()
+            try:
+                saved_local = int(report.get("local_index") or 0)
+            except Exception:
+                saved_local = 0
+            if report_type == clean_type and saved_local == local_index:
+                return instance_number
+        return None
+
+    def _next_local_index_for_type(self, account_type: str) -> int:
+        clean_type = str(account_type or "").strip().lower()
+        used: set[int] = set()
+        if not clean_type:
+            return len(self.active_instance_numbers()) + 1
+        for instance_number in self.active_instance_numbers():
+            report = self._ensure_instance_report(instance_number)
+            report_type = str(report.get("account_type") or report.get("country") or "").strip().lower()
+            if report_type != clean_type:
+                continue
+            try:
+                local_index = int(report.get("local_index") or 0)
+            except Exception:
+                local_index = 0
+            if local_index > 0:
+                used.add(local_index)
+        next_index = 1
+        while next_index in used:
+            next_index += 1
+        return next_index
+
+    def _ensure_local_indexes(self) -> None:
+        used_by_type: dict[str, set[int]] = {}
+        pending_by_type: dict[str, list[int]] = {}
+        for instance_number in self.active_instance_numbers():
+            report = self._ensure_instance_report(instance_number)
+            account_type = str(report.get("account_type") or report.get("country") or "").strip()
+            if not account_type:
+                continue
+            key = account_type.lower()
+            try:
+                local_index = int(report.get("local_index") or 0)
+            except Exception:
+                local_index = 0
+            if local_index > 0:
+                used_by_type.setdefault(key, set()).add(local_index)
+            else:
+                pending_by_type.setdefault(key, []).append(instance_number)
+
+        for key, instance_numbers in pending_by_type.items():
+            used = used_by_type.setdefault(key, set())
+            next_index = 1
+            for instance_number in sorted(instance_numbers):
+                while next_index in used:
+                    next_index += 1
+                report = self._ensure_instance_report(instance_number)
+                report["local_index"] = next_index
+                account_type = str(report.get("account_type") or report.get("country") or "").strip()
+                if account_type and not str(self.state.instance_names.get(instance_number, "")).strip():
+                    self.state.instance_names[instance_number] = f"{account_type} {next_index}"
+                used.add(next_index)
+
+    def _instance_frame_exists(self, instance_number: int) -> bool:
+        index = instance_number - 1
+        return 0 <= index < len(self.state.firefox_buttons) and self.state.firefox_buttons[index][1] is not None
+
     def is_instance_busy(self, instance_number: int) -> bool:
         status = str(self.state.run_states.get(instance_number, "")).strip().lower()
         return any(marker in status for marker in ("queue", "launch", "run", "wait", "process"))
@@ -516,6 +1974,14 @@ class InstanceManager:
             status=normalized,
             note="Set from table context menu",
         )
+        if lower_status in {"live", "die", "dead", "failed", "disabled", "checkpoint", "login required"}:
+            self.set_account_health(
+                instance_number,
+                "Live" if lower_status in {"live", "done", "ready", "success"} else normalized,
+                "Set from table context menu",
+                save_data=False,
+                refresh_table=False,
+            )
         self.set_run_status(instance_number, normalized, color)
 
     def generate_firefox_instances(self) -> None:
@@ -531,6 +1997,28 @@ class InstanceManager:
         if end_index is None:
             end_index = start_index
 
+        selected_type = self._selected_account_type_from_app()
+        if selected_type:
+            generated_instances: list[int] = []
+            for local_index in range(start_index, end_index + 1):
+                instance_number = self._instance_number_for_local_type(selected_type, local_index)
+                if instance_number is None:
+                    instance_number = self._next_available_instance_number()
+                self.state.deleted_instances.discard(instance_number)
+                self.state.instance_names[instance_number] = f"{selected_type} {local_index}"
+                report = self._ensure_instance_report(instance_number)
+                report["account_type"] = selected_type
+                report["expected_country"] = self._expected_country_from_account_type(selected_type)
+                report["local_index"] = local_index
+                if not self._instance_frame_exists(instance_number):
+                    self.open_firefox_instances(1, start_index=instance_number)
+                generated_instances.append(instance_number)
+
+            self.save_instance_data()
+            self.sync_local_profiles_to_backend_async(generated_instances)
+            self.app.refresh_dashboard()
+            return
+
         for i in range(start_index, end_index + 1):
             self.state.deleted_instances.discard(i)
 
@@ -540,23 +2028,31 @@ class InstanceManager:
         self.app.refresh_dashboard()
 
     def save_instance_data(self) -> None:
+        current_state = self._snapshot_current_platform_state()
+        self.platform_states[self.vars.platform_var.get()] = current_state
+        platform_states = self._serializable_platform_states()
         data = {
-            "credentials": self.state.credentials_dict,
-            "instance_names": self.state.instance_names,
-            "profile_names": self.state.profile_names,
-            "preview_updated_at": self.state.preview_updated_at,
-            "run_states": self.state.run_states,
-            "instance_reports": self.state.instance_reports,
-            "backend_profile_ids": self.state.backend_profile_ids,
-            "photo_upload_paths": self.state.photo_upload_paths,
-            "cover_upload_paths": self.state.cover_upload_paths,
-            "photo_upload_descriptions": self.state.photo_upload_descriptions,
+            "credentials": current_state["credentials"],
+            "instance_names": current_state["instance_names"],
+            "profile_names": current_state["profile_names"],
+            "preview_updated_at": current_state["preview_updated_at"],
+            "run_states": current_state["run_states"],
+            "instance_reports": current_state["instance_reports"],
+            "backend_profile_ids": current_state["backend_profile_ids"],
+            "photo_upload_paths": current_state["photo_upload_paths"],
+            "cover_upload_paths": current_state["cover_upload_paths"],
+            "photo_upload_descriptions": current_state["photo_upload_descriptions"],
             "browser_mode": self.vars.browser_mode_var.get(),
             "platform_mode": self.vars.platform_var.get(),
             "thread_count": int(self.vars.thread_count_var.get() or 3),
-            "deleted_instances": list(self.state.deleted_instances),
-            "active_instances": [
-                i + 1 for i, (_button, frame) in enumerate(self.state.firefox_buttons) if frame is not None
+            "platform_states": platform_states,
+            "deleted_instances": list(current_state["deleted_instances"]),
+            "active_instances": current_state["active_instances"],
+            "country_types": [
+                value for value in getattr(self.app, "legacy_stores", ["All"]) if str(value or "").strip()
+            ],
+            "custom_account_types": [
+                value for value in getattr(self.app, "account_groups", ["All"]) if str(value or "").strip()
             ],
         }
         self.storage.save_state(data)
@@ -564,23 +2060,31 @@ class InstanceManager:
             json.dump(data, handle)
 
     def backup_instance_data(self) -> None:
+        current_state = self._snapshot_current_platform_state()
+        self.platform_states[self.vars.platform_var.get()] = current_state
+        platform_states = self._serializable_platform_states()
         data = {
-            "credentials": self.state.credentials_dict,
-            "instance_names": self.state.instance_names,
-            "profile_names": self.state.profile_names,
-            "preview_updated_at": self.state.preview_updated_at,
-            "run_states": self.state.run_states,
-            "instance_reports": self.state.instance_reports,
-            "backend_profile_ids": self.state.backend_profile_ids,
-            "photo_upload_paths": self.state.photo_upload_paths,
-            "cover_upload_paths": self.state.cover_upload_paths,
-            "photo_upload_descriptions": self.state.photo_upload_descriptions,
+            "credentials": current_state["credentials"],
+            "instance_names": current_state["instance_names"],
+            "profile_names": current_state["profile_names"],
+            "preview_updated_at": current_state["preview_updated_at"],
+            "run_states": current_state["run_states"],
+            "instance_reports": current_state["instance_reports"],
+            "backend_profile_ids": current_state["backend_profile_ids"],
+            "photo_upload_paths": current_state["photo_upload_paths"],
+            "cover_upload_paths": current_state["cover_upload_paths"],
+            "photo_upload_descriptions": current_state["photo_upload_descriptions"],
             "browser_mode": self.vars.browser_mode_var.get(),
             "platform_mode": self.vars.platform_var.get(),
             "thread_count": int(self.vars.thread_count_var.get() or 3),
-            "deleted_instances": list(self.state.deleted_instances),
-            "active_instances": [
-                i + 1 for i, (_button, frame) in enumerate(self.state.firefox_buttons) if frame is not None
+            "platform_states": platform_states,
+            "deleted_instances": list(current_state["deleted_instances"]),
+            "active_instances": current_state["active_instances"],
+            "country_types": [
+                value for value in getattr(self.app, "legacy_stores", ["All"]) if str(value or "").strip()
+            ],
+            "custom_account_types": [
+                value for value in getattr(self.app, "account_groups", ["All"]) if str(value or "").strip()
             ],
         }
         self.storage.write_backup(data)
@@ -608,6 +2112,45 @@ class InstanceManager:
             account_id = clean_row.get("uid") or clean_row.get("account_id") or clean_row.get("id")
             profile_name = clean_row.get("name") or clean_row.get("account_name") or clean_row.get("profile")
             gmail = clean_row.get("gmail") or clean_row.get("email")
+            date_birth = clean_row.get("date_birth") or clean_row.get("birthday") or clean_row.get("birthdate")
+            gender = clean_row.get("gender") or clean_row.get("sex")
+            ip_address = clean_row.get("ip") or clean_row.get("account_ip") or clean_row.get("proxy_ip")
+            country = clean_row.get("country") or clean_row.get("account_country") or clean_row.get("region")
+            expected_country = clean_row.get("expected_country") or clean_row.get("target_country") or clean_row.get("vpn_country")
+            proxy = clean_row.get("proxy") or clean_row.get("proxy_url") or clean_row.get("socks") or clean_row.get("http_proxy")
+            explicit_country_type = clean_row.get("country_type") or clean_row.get("country_group")
+            custom_account_type = (
+                clean_row.get("custom_account_type")
+                or clean_row.get("account_group")
+                or clean_row.get("usage_type")
+                or clean_row.get("work_type")
+            )
+            legacy_type_value = clean_row.get("account_type") or clean_row.get("type")
+            if explicit_country_type:
+                account_type = explicit_country_type
+                custom_account_type = custom_account_type or legacy_type_value
+            else:
+                account_type = (
+                    legacy_type_value
+                    or clean_row.get("store")
+                    or clean_row.get("group")
+                    or self._selected_account_type_from_app()
+                    or country
+                )
+            try:
+                local_index = int(
+                    clean_row.get("local_index")
+                    or clean_row.get("local")
+                    or clean_row.get("no")
+                    or clean_row.get("number")
+                    or 0
+                )
+            except Exception:
+                local_index = 0
+            if account_type and local_index <= 0:
+                local_index = self._next_local_index_for_type(account_type)
+            if proxy and not ip_address:
+                ip_address = self._proxy_host(proxy)
             status = clean_row.get("status") or "Idle"
             platform = clean_row.get("platform") or self.vars.platform_var.get()
             if platform and platform in self.PLATFORM_HOME_URLS:
@@ -616,8 +2159,11 @@ class InstanceManager:
             while next_instance in self.state.deleted_instances:
                 next_instance += 1
 
+            if account_type and local_index > 0:
+                self.state.instance_names[next_instance] = f"{account_type} {local_index}"
+            else:
+                self.state.instance_names[next_instance] = f"Firefox {next_instance}"
             self.open_firefox_instances(1, start_index=next_instance)
-            self.state.instance_names[next_instance] = f"Firefox {next_instance}"
             if profile_name:
                 self.state.profile_names[next_instance] = profile_name
             report = self._ensure_instance_report(next_instance)
@@ -625,8 +2171,30 @@ class InstanceManager:
                 report["account_id"] = account_id
             if gmail:
                 report["gmail"] = gmail
+            if date_birth:
+                report["date_birth"] = date_birth
+            if gender:
+                report["gender"] = self._normalize_gender(gender)
+            if ip_address:
+                report["ip"] = ip_address
+            if country:
+                report["country"] = country
+            if proxy:
+                report["proxy"] = proxy
+            if account_type:
+                report["account_type"] = account_type
+                report["expected_country"] = expected_country or self._expected_country_from_account_type(account_type)
+            elif expected_country:
+                report["expected_country"] = expected_country
+            if custom_account_type:
+                report["custom_account_type"] = custom_account_type
+            if local_index > 0:
+                report["local_index"] = local_index
             report["last_action"] = "Imported"
             report["last_status"] = status
+            report["account_status"] = status
+            report["account_reason"] = "Imported account row"
+            report["account_checked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             report["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self.state.run_states[next_instance] = status
             self._apply_saved_run_status(next_instance)
@@ -646,20 +2214,29 @@ class InstanceManager:
         rows = self.get_report_rows()
         fieldnames = [
             "instance",
+            "local_account",
+            "country_type",
+            "account_type",
+            "expected_country",
             "profile",
             "account_id",
+            "ip",
+            "country",
+            "proxy",
             "date_birth",
             "gender",
             "gmail",
             "action",
             "status",
+            "reason",
+            "checked",
             "runs",
             "done",
             "failed",
             "updated",
         ]
         with open(output_path, "w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(rows)
         return len(rows)
@@ -682,11 +2259,12 @@ class InstanceManager:
         int,
         set[int],
         list[int],
+        dict,
     ]:
         data = self.storage.load_state()
         if data is None:
             if not DATA_FILE.exists():
-                return {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, "pc", "facebook", 3, set(), []
+                return {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, "pc", "facebook", 3, set(), [], {}
             with DATA_FILE.open("r", encoding="utf-8") as handle:
                 data = json.load(handle)
 
@@ -721,6 +2299,52 @@ class InstanceManager:
         thread_count = max(1, min(10, thread_count))
         deleted_instances = {int(value) for value in data.get("deleted_instances", [])}
         active_instances = [int(value) for value in data.get("active_instances", [])]
+        platform_states = data.get("platform_states", {})
+        saved_country_types = {
+            str(value).strip()
+            for value in data.get("country_types", [])
+            if str(value or "").strip()
+        }
+        saved_custom_account_types = {
+            str(value).strip()
+            for value in data.get("custom_account_types", [])
+            if str(value or "").strip()
+        }
+        if isinstance(platform_states, dict):
+            for raw_platform_state in platform_states.values():
+                if not isinstance(raw_platform_state, dict):
+                    continue
+                saved_country_types.update(
+                    str(value).strip()
+                    for value in raw_platform_state.get("country_types", [])
+                    if str(value or "").strip()
+                )
+                saved_custom_account_types.update(
+                    str(value).strip()
+                    for value in raw_platform_state.get("custom_account_types", [])
+                    if str(value or "").strip()
+                )
+        self.saved_country_types = ["All"] + sorted(value for value in saved_country_types if value != "All")
+        self.saved_custom_account_types = ["All"] + sorted(value for value in saved_custom_account_types if value != "All")
+        if not isinstance(platform_states, dict) or not platform_states:
+            platform_states = {
+                "facebook": {
+                    "credentials": credentials,
+                    "instance_names": instance_names,
+                    "profile_names": profile_names,
+                    "preview_updated_at": preview_updated_at,
+                    "run_states": run_states,
+                    "instance_reports": instance_reports,
+                    "backend_profile_ids": backend_profile_ids,
+                    "photo_upload_paths": photo_upload_paths,
+                    "cover_upload_paths": cover_upload_paths,
+                    "photo_upload_descriptions": photo_upload_descriptions,
+                    "country_types": self.saved_country_types,
+                    "custom_account_types": self.saved_custom_account_types,
+                    "deleted_instances": list(deleted_instances),
+                    "active_instances": active_instances,
+                }
+            }
         return (
             credentials,
             instance_names,
@@ -737,6 +2361,7 @@ class InstanceManager:
             thread_count,
             deleted_instances,
             active_instances,
+            platform_states,
         )
 
     def initialize_app(self) -> None:
@@ -756,25 +2381,36 @@ class InstanceManager:
             thread_count,
             deleted_instances,
             active_instances,
+            platform_states,
         ) = self.load_instance_data()
-        self.state.credentials_dict = credentials
-        self.state.instance_names = instance_names
-        self.state.profile_names = profile_names
-        self.state.preview_updated_at = preview_updated_at
-        self.state.run_states = run_states
-        self.state.instance_reports = instance_reports
-        self.state.backend_profile_ids = backend_profile_ids
-        self.state.photo_upload_paths = photo_upload_paths
-        self.state.cover_upload_paths = cover_upload_paths
-        self.state.photo_upload_descriptions = photo_upload_descriptions
         self.vars.browser_mode_var.set(browser_mode)
         self.vars.platform_var.set(platform_mode)
         self.vars.thread_count_var.set(thread_count)
-        self.state.deleted_instances = deleted_instances
-        self._hydrate_reports_from_cookie_files()
-        for i in active_instances:
-            self.open_firefox_instances(1, start_index=i)
-        self.sync_local_profiles_to_backend_async()
+        self.current_platform = platform_mode
+        self.platform_states = {
+            platform: self._normalize_platform_state(state)
+            for platform, state in platform_states.items()
+            if platform in self.PLATFORM_HOME_URLS
+        }
+        if platform_mode not in self.platform_states:
+            self.platform_states[platform_mode] = self._normalize_platform_state(
+                {
+                    "credentials": credentials,
+                    "instance_names": instance_names,
+                    "profile_names": profile_names,
+                    "preview_updated_at": preview_updated_at,
+                    "run_states": run_states,
+                    "instance_reports": instance_reports,
+                    "backend_profile_ids": backend_profile_ids,
+                    "photo_upload_paths": photo_upload_paths,
+                    "cover_upload_paths": cover_upload_paths,
+                    "photo_upload_descriptions": photo_upload_descriptions,
+                    "deleted_instances": list(deleted_instances),
+                    "active_instances": active_instances,
+                }
+            )
+        self._remove_copied_non_facebook_states()
+        self._load_platform_state(platform_mode)
 
     def save_credentials_from_entries(self) -> None:
         for instance_number, entry in self.state.credential_entries.items():
@@ -802,6 +2438,7 @@ class InstanceManager:
         ):
             return
 
+        instance_folder = self.firefox_profile_dir(instance_number)
         self.state.credentials_dict.pop(instance_number, None)
         self.state.instance_names.pop(instance_number, None)
         self.state.profile_names.pop(instance_number, None)
@@ -813,7 +2450,6 @@ class InstanceManager:
         self.state.photo_upload_descriptions.pop(instance_number, None)
         self.state.deleted_instances.add(instance_number)
 
-        instance_folder = FIREFOX_USER_DATA_DIR / f"Firefox_{instance_number}"
         if instance_folder.exists():
             try:
                 shutil.rmtree(instance_folder)
@@ -903,7 +2539,90 @@ class InstanceManager:
         self.app.refresh_dashboard()
 
     def open_data_folder(self) -> None:
-        os.startfile(os.path.realpath(FIREFOX_USER_DATA_DIR))
+        folder_window = self.app.create_modal("Open Folder", "560x520", modal=False)
+        body = self.app.create_modal_card(
+            folder_window,
+            "Open Platform Function Folder",
+            "Choose a platform, then open the folder for that platform function.",
+        )
+
+        platform_buttons_frame = self.app.Frame(body, bg=SURFACE_BG)
+        platform_buttons_frame.pack(fill="x", pady=(0, 10))
+        function_buttons_frame = self.app.Frame(body, bg=SURFACE_BG)
+        function_buttons_frame.pack(fill="both", expand=True)
+
+        def folder_name(label: str) -> str:
+            clean_label = re.sub(r'[<>:"/\\|?*]+', " ", label).strip()
+            clean_label = re.sub(r"\s+", " ", clean_label)
+            return clean_label or "Folder"
+
+        def platform_label(platform: str) -> str:
+            for label, value in self.app.PLATFORMS:
+                if value == platform:
+                    return label
+            return platform.title()
+
+        def function_folder(platform: str, label: str) -> str:
+            folder_path = PLATFORM_FOLDER_DIRS[platform] / folder_name(label)
+            folder_path.mkdir(parents=True, exist_ok=True)
+            return os.path.realpath(folder_path)
+
+        def ensure_platform_folders(platform: str) -> None:
+            PLATFORM_FOLDER_DIRS[platform].mkdir(parents=True, exist_ok=True)
+            for action_label, _action_value in self.app.ACTIONS_BY_PLATFORM.get(platform, []):
+                function_folder(platform, action_label)
+
+        def open_folder(path: str) -> None:
+            os.startfile(path)
+            if folder_window.winfo_exists():
+                folder_window.destroy()
+
+        def show_platform(platform: str) -> None:
+            ensure_platform_folders(platform)
+            for child in function_buttons_frame.winfo_children():
+                child.destroy()
+
+            label = platform_label(platform)
+            self.app.Label(
+                function_buttons_frame,
+                text=f"{label} folders",
+                bg=SURFACE_BG,
+                fg=TEXT_PRIMARY,
+                font=SECTION_FONT,
+            ).pack(anchor="w", pady=(0, 8))
+
+            self.app.create_button(
+                function_buttons_frame,
+                f"Open {label} Main Folder",
+                lambda path=os.path.realpath(PLATFORM_FOLDER_DIRS[platform]): open_folder(path),
+                kind="primary",
+                compact=True,
+                full_width=True,
+            ).pack(fill="x", pady=(0, 8))
+
+            for action_label, _action_value in self.app.ACTIONS_BY_PLATFORM.get(platform, []):
+                self.app.create_button(
+                    function_buttons_frame,
+                    action_label,
+                    lambda path=function_folder(platform, action_label): open_folder(path),
+                    kind="secondary",
+                    compact=True,
+                    full_width=True,
+                ).pack(fill="x", pady=3)
+
+        for label, platform in self.app.PLATFORMS:
+            self.app.create_button(
+                platform_buttons_frame,
+                label,
+                lambda platform=platform: show_platform(platform),
+                kind="primary" if platform == self.vars.platform_var.get() else "secondary",
+                compact=True,
+            ).pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        current_platform = self.vars.platform_var.get()
+        if current_platform not in PLATFORM_FOLDER_DIRS:
+            current_platform = "facebook"
+        show_platform(current_platform)
 
     def reload_instance_image(self, instance_number: int) -> None:
         self._set_instance_body_visibility(instance_number)
@@ -921,6 +2640,8 @@ class InstanceManager:
         clean_name = profile_name.strip()
         if not clean_name:
             return
+        if self.state.profile_names.get(instance_number) == clean_name:
+            return
         self.state.profile_names[instance_number] = clean_name
         label = self.state.avatar_name_labels.get(instance_number)
         if label:
@@ -933,6 +2654,8 @@ class InstanceManager:
         if not clean_id:
             return
         report = self._ensure_instance_report(instance_number)
+        if str(report.get("account_id", "") or "").strip() == clean_id:
+            return
         report["account_id"] = clean_id
         self.save_instance_data()
         self.sync_local_profiles_to_backend_async([instance_number])
@@ -945,11 +2668,13 @@ class InstanceManager:
         date_birth: str = "",
         gender: str = "",
         gmail: str = "",
+        save_data: bool = True,
+        refresh_table: bool = True,
     ) -> None:
         report = self._ensure_instance_report(instance_number)
         updates = {
             "date_birth": str(date_birth or "").strip(),
-            "gender": str(gender or "").strip(),
+            "gender": self._normalize_gender(gender) if gender else "",
             "gmail": str(gmail or "").strip(),
         }
         changed = False
@@ -959,9 +2684,109 @@ class InstanceManager:
                 changed = True
         if not changed:
             return
-        self.save_instance_data()
-        self.sync_local_profiles_to_backend_async([instance_number])
-        if hasattr(self.app, "refresh_report_table_async"):
+        if save_data:
+            self.save_instance_data()
+            self.sync_local_profiles_to_backend_async([instance_number])
+        if refresh_table and hasattr(self.app, "refresh_report_table_async"):
+            self.app.refresh_report_table_async()
+
+    def set_network_identity(
+        self,
+        instance_number: int,
+        ip_address: str = "",
+        country: str = "",
+        proxy: str = "",
+        save_data: bool = True,
+        refresh_table: bool = True,
+    ) -> None:
+        report = self._ensure_instance_report(instance_number)
+        updates = {
+            "ip": str(ip_address or "").strip(),
+            "country": str(country or "").strip(),
+            "proxy": str(proxy or "").strip(),
+        }
+        changed = False
+        for key, value in updates.items():
+            if value and report.get(key) != value:
+                report[key] = value
+                changed = True
+        if not changed:
+            return
+        if save_data:
+            self.save_instance_data()
+            self.sync_local_profiles_to_backend_async([instance_number])
+        if refresh_table and hasattr(self.app, "refresh_report_table_async"):
+            self.app.refresh_report_table_async()
+
+    def set_account_type(
+        self,
+        instance_number: int,
+        account_type: str,
+        save_data: bool = True,
+        refresh_table: bool = True,
+    ) -> None:
+        clean_type = str(account_type or "").strip()
+        if not clean_type or clean_type.lower() in {"all", "store"}:
+            return
+        report = self._ensure_instance_report(instance_number)
+        expected_country = self._expected_country_from_account_type(clean_type)
+        if (
+            str(report.get("account_type", "") or "").strip() == clean_type
+            and str(report.get("expected_country", "") or "").strip() == expected_country
+        ):
+            return
+        report["account_type"] = clean_type
+        report["expected_country"] = expected_country
+        report["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if save_data:
+            self.save_instance_data()
+            self.sync_local_profiles_to_backend_async([instance_number])
+        if refresh_table and hasattr(self.app, "refresh_report_table_async"):
+            self.app.refresh_report_table_async()
+
+    def set_custom_account_type(
+        self,
+        instance_number: int,
+        account_type: str,
+        save_data: bool = True,
+        refresh_table: bool = True,
+    ) -> None:
+        clean_type = str(account_type or "").strip()
+        if not clean_type or clean_type.lower() in {"all", "store"}:
+            return
+        report = self._ensure_instance_report(instance_number)
+        if str(report.get("custom_account_type", "") or "").strip() == clean_type:
+            return
+        report["custom_account_type"] = clean_type
+        report["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if save_data:
+            self.save_instance_data()
+            self.sync_local_profiles_to_backend_async([instance_number])
+        if refresh_table and hasattr(self.app, "refresh_report_table_async"):
+            self.app.refresh_report_table_async()
+
+    def set_account_health(
+        self,
+        instance_number: int,
+        status: str,
+        reason: str = "",
+        save_data: bool = True,
+        refresh_table: bool = True,
+    ) -> None:
+        clean_status = str(status or "").strip() or "Unknown"
+        clean_reason = str(reason or "").strip()
+        report = self._ensure_instance_report(instance_number)
+        report["account_status"] = clean_status
+        report["account_reason"] = clean_reason
+        report["account_checked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if clean_reason:
+            report["last_note"] = clean_reason
+        if clean_status in {"Live", "Checkpoint", "Disabled", "Login required", "Review", "Check error", "Launch failed"}:
+            report["last_status"] = clean_status
+        if save_data:
+            self.save_instance_data()
+            self.sync_local_profiles_to_backend_async([instance_number])
+        if refresh_table and hasattr(self.app, "refresh_report_table_async"):
             self.app.refresh_report_table_async()
 
     def set_preview_status(self, instance_number: int, status: str, color: str = TEXT_MUTED) -> None:
@@ -1053,7 +2878,16 @@ class InstanceManager:
         text = str(self.state.run_states.get(instance_number) or saved_report.get("last_status") or "Idle")
         color = TEXT_MUTED
         normalized = text.lower()
-        if "fail" in normalized or "error" in normalized or "die" in normalized or "dead" in normalized:
+        if (
+            "fail" in normalized
+            or "error" in normalized
+            or "die" in normalized
+            or "dead" in normalized
+            or "checkpoint" in normalized
+            or "disabled" in normalized
+            or "suspended" in normalized
+            or "login required" in normalized
+        ):
             color = DANGER
         elif "run" in normalized or "launch" in normalized or "done" in normalized or "live" in normalized or "ready" in normalized:
             color = SUCCESS
@@ -1062,34 +2896,92 @@ class InstanceManager:
         self.set_run_status(instance_number, text, color, persist_report=False, save_data=False, refresh_table=False)
 
     def get_report_rows(self) -> list[dict[str, str]]:
+        self._ensure_local_indexes()
         instance_ids = {
             *self.state.instance_names.keys(),
             *self.state.profile_names.keys(),
             *self.state.run_states.keys(),
             *self.state.instance_reports.keys(),
+            *{
+                i + 1
+                for i, (_button, frame) in enumerate(self.state.firefox_buttons)
+                if frame is not None
+            },
         }
         rows: list[dict[str, str]] = []
         for instance_number in sorted(instance_ids):
             if instance_number in self.state.deleted_instances:
                 continue
             report = self._ensure_instance_report(instance_number)
+            account_status = self.report_account_status(report)
+            account_reason = self.report_account_reason(report, account_status)
+            gmail_value = str(report.get("gmail", "") or "").strip()
+            if not gmail_value and str(account_status or "").strip().lower() == "live":
+                gmail_value = "No Gmail"
             rows.append(
                 {
-                    "instance": f"Firefox {instance_number}",
-                    "profile": self.state.profile_names.get(instance_number, "No account name"),
+                    "instance_id": str(instance_number),
+                    "instance": self._display_firefox_label(instance_number, report),
+                    "local_account": self._local_account_label(instance_number, report),
+                    "country_type": str(report.get("account_type") or report.get("country") or "-"),
+                    "account_type": str(report.get("custom_account_type") or "-"),
+                    "expected_country": str(report.get("expected_country") or self.expected_country_for_instance(instance_number) or "-"),
+                    "profile": self.state.profile_names.get(
+                        instance_number,
+                        self.state.instance_names.get(instance_number, "No account name"),
+                    ),
                     "account_id": str(report.get("account_id", "") or "-"),
+                    "ip": str(report.get("ip", "") or "-"),
+                    "country": str(report.get("country", "") or "-"),
+                    "proxy": str(report.get("proxy", "") or "-"),
                     "date_birth": str(report.get("date_birth", "") or "-"),
                     "gender": str(report.get("gender", "") or "-"),
-                    "gmail": str(report.get("gmail", "") or "-"),
+                    "gmail": gmail_value or "-",
                     "action": str(report.get("last_action", "None")),
-                    "status": str(report.get("last_status", self.state.run_states.get(instance_number, "Idle"))),
+                    "status": account_status,
+                    "reason": account_reason,
+                    "checked": str(report.get("account_checked_at") or "-"),
                     "runs": str(report.get("run_count", 0)),
                     "done": str(report.get("success_count", 0)),
                     "failed": str(report.get("fail_count", 0)),
                     "updated": str(report.get("last_updated", "-")),
                 }
-            )
+        )
+        rows.sort(key=self._report_row_sort_key)
         return rows
+
+    def _report_row_sort_key(self, row: dict[str, str]) -> tuple[str, int, int]:
+        account_type = str(row.get("country_type") or row.get("account_type") or "").strip().lower()
+        try:
+            local_index = int(str(row.get("local_account") or "").strip().rsplit(" ", 1)[1])
+        except Exception:
+            try:
+                local_index = int(str(row.get("instance") or "").strip().rsplit(" ", 1)[1])
+            except Exception:
+                local_index = 0
+        try:
+            instance_id = int(str(row.get("instance_id") or 0))
+        except Exception:
+            instance_id = 0
+        return account_type, local_index, instance_id
+
+    def _local_account_label(self, instance_number: int, report: dict) -> str:
+        account_type = str(report.get("account_type") or report.get("country") or "").strip()
+        local_index = str(report.get("local_index") or "").strip()
+        if account_type and local_index:
+            return f"{account_type} {local_index}"
+        if account_type:
+            return account_type
+        return f"Account {instance_number}"
+
+    def _display_firefox_label(self, instance_number: int, report: dict) -> str:
+        try:
+            local_index = int(report.get("local_index") or 0)
+        except Exception:
+            local_index = 0
+        if local_index > 0 and str(report.get("account_type") or report.get("country") or "").strip():
+            return f"Firefox {local_index}"
+        return f"Firefox {instance_number}"
 
     def _action_label(self, action_key: str) -> str:
         labels = {
@@ -1123,7 +3015,17 @@ class InstanceManager:
         report.setdefault("last_action", "None")
         report.setdefault("last_status", self.state.run_states.get(instance_number, "Idle"))
         report.setdefault("last_note", "")
+        report.setdefault("account_status", "")
+        report.setdefault("account_reason", "")
+        report.setdefault("account_checked_at", "")
         report.setdefault("account_id", "")
+        report.setdefault("account_type", "")
+        report.setdefault("custom_account_type", "")
+        report.setdefault("local_index", "")
+        report.setdefault("expected_country", "")
+        report.setdefault("ip", "")
+        report.setdefault("country", "")
+        report.setdefault("proxy", "")
         report.setdefault("date_birth", "")
         report.setdefault("gender", "")
         report.setdefault("gmail", "")
@@ -1133,10 +3035,65 @@ class InstanceManager:
         report.setdefault("fail_count", 0)
         report.setdefault("_result_pending", False)
         report.setdefault("_last_counted_signature", "")
+        if not str(report.get("expected_country") or "").strip():
+            account_type = str(report.get("account_type") or "").strip()
+            if account_type:
+                report["expected_country"] = self._expected_country_from_account_type(account_type)
         self.state.instance_reports[instance_number] = report
         return report
 
+    def report_account_status(self, report: dict) -> str:
+        status = str(report.get("account_status") or "").strip()
+        if status and status.lower() != "unknown":
+            if status.lower() == "live" and self._is_weak_live_report(report):
+                return "Unknown"
+            return status
+
+        legacy_status = str(report.get("last_status") or "").strip()
+        normalized = legacy_status.lower()
+        if normalized in {"live", "checkpoint", "disabled", "login required", "review", "check error"}:
+            if normalized == "live" and self._is_weak_live_report(report):
+                return "Unknown"
+            return legacy_status
+        if any(marker in normalized for marker in ("checkpoint", "disabled", "suspended", "login required")):
+            return legacy_status
+        return "Unknown"
+
+    def report_account_reason(self, report: dict, status: str | None = None) -> str:
+        reason = str(report.get("account_reason") or "").strip()
+        effective_status = status or self.report_account_status(report)
+        if reason and not (effective_status == "Unknown" and self._is_weak_live_report(report)):
+            return reason
+        note = str(report.get("last_note") or "").strip()
+        if note and not (effective_status == "Unknown" and self._is_weak_live_text(note)):
+            return note
+        if effective_status == "Unknown":
+            if str(report.get("account_id") or "").strip():
+                return "Saved identity only; run Check Live for real state."
+            return "Run Check Live for real state."
+        return "-"
+
+    def _is_weak_live_report(self, report: dict) -> bool:
+        reason = str(report.get("account_reason") or report.get("last_note") or "").strip().lower()
+        if self._is_weak_live_text(reason):
+            return True
+        if not str(report.get("account_checked_at") or "").strip():
+            return True
+        return False
+
+    def _is_weak_live_text(self, text: str) -> bool:
+        reason = str(text or "").strip().lower()
+        weak_markers = (
+            "account id saved",
+            "c_user cookie exists",
+            "login detected in browser session",
+            "identity was read",
+        )
+        return any(marker in reason for marker in weak_markers)
+
     def _hydrate_reports_from_cookie_files(self) -> None:
+        if self.vars.platform_var.get() != "facebook":
+            return
         changed = False
         for cookie_file in COOKIE_DIR.glob("cookies_*.json"):
             match = re.search(r"cookies_(\d+)\.json$", cookie_file.name)
@@ -1147,8 +3104,6 @@ class InstanceManager:
                 continue
 
             report = self._ensure_instance_report(instance_number)
-            if str(report.get("account_id", "") or "").strip():
-                continue
 
             try:
                 with cookie_file.open("r", encoding="utf-8") as handle:
@@ -1161,8 +3116,9 @@ class InstanceManager:
                     continue
                 cookie_value = str(cookie.get("value", "")).strip()
                 if cookie_value.isdigit():
-                    report["account_id"] = cookie_value
-                    changed = True
+                    if not str(report.get("account_id", "") or "").strip():
+                        report["account_id"] = cookie_value
+                        changed = True
                     break
 
         if changed:
@@ -1198,6 +3154,12 @@ class InstanceManager:
             "credential format error",
             "unknown action",
             "not running",
+            "ip mismatch",
+            "checkpoint",
+            "disabled",
+            "suspended",
+            "login required",
+            "check error",
         }
         if report.get("_result_pending", False):
             if status_value in success_markers and signature != report.get("_last_counted_signature", ""):
@@ -1344,16 +3306,25 @@ class InstanceManager:
             metadata = {
                 "instance_number": instance_number,
                 "account_id": str(report.get("account_id", "") or ""),
+                "account_type": str(report.get("account_type", "") or ""),
+                "custom_account_type": str(report.get("custom_account_type", "") or ""),
+                "expected_country": str(report.get("expected_country", "") or ""),
+                "ip": str(report.get("ip", "") or ""),
+                "country": str(report.get("country", "") or ""),
+                "proxy": str(report.get("proxy", "") or ""),
                 "date_birth": str(report.get("date_birth", "") or ""),
                 "gender": str(report.get("gender", "") or ""),
                 "gmail": str(report.get("gmail", "") or ""),
+                "account_status": self.report_account_status(report),
+                "account_reason": str(report.get("account_reason", "") or ""),
+                "account_checked_at": str(report.get("account_checked_at", "") or ""),
             }
             profile_name = self.state.profile_names.get(
                 instance_number,
                 self.state.instance_names.get(instance_number, f"Firefox {instance_number}"),
             )
             session_label = self.state.instance_names.get(instance_number, f"Firefox {instance_number}")
-            last_status = str(report.get("last_status") or self.state.run_states.get(instance_number, "Idle"))
+            last_status = self.report_account_status(report)
 
             existing_id = self.state.backend_profile_ids.get(instance_number)
             remote_profile = profiles_by_id.get(existing_id) if existing_id else None
@@ -1406,7 +3377,21 @@ class InstanceManager:
         metadata = profile.get("metadata") or {}
         report = self._ensure_instance_report(instance_number)
         changed = False
-        for report_key in ("account_id", "date_birth", "gender", "gmail"):
+        for report_key in (
+            "account_id",
+            "account_type",
+            "custom_account_type",
+            "expected_country",
+            "ip",
+            "country",
+            "proxy",
+            "date_birth",
+            "gender",
+            "gmail",
+            "account_status",
+            "account_reason",
+            "account_checked_at",
+        ):
             existing_value = str(report.get(report_key, "") or "").strip()
             backend_value = str(metadata.get(report_key, "") or "").strip()
             if not existing_value and backend_value:
