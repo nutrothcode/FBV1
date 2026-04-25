@@ -22,6 +22,7 @@ from selenium import webdriver
 from selenium.webdriver.firefox.options import Options as FirefoxOptions
 from selenium.webdriver.firefox.service import Service as FirefoxService
 
+from .auth_manager import AuthManager, AuthCheckResult
 from .config import (
     APP_DB_PATH,
     BACKUP_DIR,
@@ -56,6 +57,7 @@ class InstanceManager:
     def __init__(self, app: "FacebookToolApp") -> None:
         self.app = app
         self.storage = AccountStateStore(APP_DB_PATH, BACKUP_DIR)
+        self.auth = AuthManager()
         self.platform_states: dict[str, dict] = {}
         self.current_platform = "facebook"
         self._route_identity_cache: dict[str, tuple[float, str, str]] = {}
@@ -672,6 +674,20 @@ class InstanceManager:
         self.set_run_status(instance_number, "Queued", WARNING)
         try:
             platform = self.vars.platform_var.get()
+            if action == "open_home":
+                self.open_platform_action(instance_number, "open_home", platform)
+                return
+            if action in {"refresh_login", "check_login", "check_gmail", "check_channel", "check_api"}:
+                self.check_live_instance(instance_number, platform)
+                return
+            if action == "clear_token":
+                self.clear_auth_for_instance(platform, instance_number)
+                self.set_run_status(instance_number, "Need Reconnect", WARNING)
+                return
+            if action == "reconnect_required":
+                self.set_run_status(instance_number, "Need Reconnect", WARNING)
+                self.set_account_health(instance_number, "Need Reconnect", "Reconnect with official authorization.")
+                return
             if platform != "facebook":
                 action_urls = self.PLATFORM_ACTION_URLS.get(platform, {})
                 target_url = action_urls.get(action, self.PLATFORM_HOME_URLS.get(platform, "https://www.google.com"))
@@ -696,8 +712,8 @@ class InstanceManager:
                 self.set_run_status(instance_number, "Ready", SUCCESS)
                 return
 
-            if action == "login":
-                self.app.browser.open_firefox_instance(instance_number)
+            if action in {"login", "connect_account"}:
+                self.app.browser.open_firefox_instance(instance_number, login=False)
             elif action == "care":
                 self.app.browser.open_firefox_instance(instance_number, login=False)
                 self.app.actions.watch_facebook_videos([instance_number])
@@ -752,6 +768,18 @@ class InstanceManager:
             logging.error("Action %s failed for Firefox %s: %s", action_label, instance_number, exc)
             self.set_run_status(instance_number, "Failed", DANGER)
 
+    def open_platform_action(self, instance_number: int, action: str = "open_home", platform: str | None = None) -> None:
+        platform = platform or self.vars.platform_var.get()
+        action_urls = self.PLATFORM_ACTION_URLS.get(platform, {})
+        target_url = action_urls.get(action, self.PLATFORM_HOME_URLS.get(platform, "https://www.facebook.com"))
+        self.app.browser.open_firefox_instance(
+            instance_number,
+            login=False,
+            start_url=target_url,
+            sync_preview=False,
+        )
+        self.set_run_status(instance_number, "Ready", SUCCESS)
+
     def start_all_instances(self) -> None:
         if self.state.batch_running:
             return
@@ -789,13 +817,13 @@ class InstanceManager:
         selected_type = (account_type or self._selected_account_type_from_app()).strip()
         if not selected_type:
             if show_empty_warning:
-                self.app.messagebox.showwarning("Check Live", "Select one account type first. Check Live does not run on All.")
+                self.app.messagebox.showwarning("Check Login", "Select one account type first. Check Login does not run on All.")
             return
         instance_numbers = self.active_instance_numbers_for_type(selected_type)
         if not instance_numbers:
             if show_empty_warning:
                 suffix = f" in account type {selected_type}" if selected_type else ""
-                self.app.messagebox.showwarning("Check Live", f"No active Firefox profiles found{suffix} for this platform.")
+                self.app.messagebox.showwarning("Check Login", f"No active Firefox profiles found{suffix} for this platform.")
             return
 
         try:
@@ -816,8 +844,6 @@ class InstanceManager:
     def _check_live_batch(self, instance_numbers: list[int], max_workers: int, platform: str) -> None:
         work_queue: queue.Queue[int] = queue.Queue()
         for instance_number in instance_numbers:
-            if self._apply_live_check_preflight_result(instance_number, platform):
-                continue
             self._queue_live_check_result(instance_number)
             work_queue.put(instance_number)
 
@@ -861,7 +887,7 @@ class InstanceManager:
     def _queue_live_check_result(self, instance_number: int) -> None:
         report = self._ensure_instance_report(instance_number)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        report["last_action"] = "Check Live"
+        report["last_action"] = "Check Login"
         report["last_status"] = "Queued"
         report["last_note"] = "Waiting for check worker..."
         report["account_status"] = "Queued"
@@ -875,29 +901,9 @@ class InstanceManager:
             self._record_live_check_result(instance_number, *country_guard_result)
             return True
 
-        cookies = self._load_session_cookies(instance_number, platform)
         browser_result = self._classify_running_browser_session(instance_number, platform)
-        if not cookies:
-            if browser_result:
-                self._record_live_check_result(instance_number, *browser_result)
-            else:
-                self._record_live_check_result(
-                    instance_number,
-                    "Unknown",
-                    WARNING,
-                    "No saved cookies found; open/login this profile first, then run Check Live.",
-                )
-            return True
-        if not self._has_required_login_cookie(platform, cookies):
-            if browser_result and browser_result[0] in {"Disabled", "Checkpoint", "Live"}:
-                self._record_live_check_result(instance_number, *browser_result)
-            else:
-                self._record_live_check_result(
-                    instance_number,
-                    "Login required",
-                    DANGER,
-                    f"{self._platform_label(platform)} login cookie was not found.",
-                )
+        if browser_result and browser_result[0] in {"Disabled", "Checkpoint"}:
+            self._record_live_check_result(instance_number, *browser_result)
             return True
         return False
 
@@ -937,21 +943,107 @@ class InstanceManager:
         platform = platform or self.vars.platform_var.get()
         self._begin_live_check_result(instance_number)
         self.set_run_status(instance_number, "Checking", WARNING)
-        status, note, color = self._check_live_instance_background(instance_number, platform)
-        self._record_live_check_result(instance_number, status, color, note)
+        country_guard = self._live_check_country_guard_result(instance_number)
+        if country_guard:
+            status, note, color = country_guard
+            self._record_live_check_result(instance_number, status, color, note)
+            return
+        report = self._ensure_instance_report(instance_number)
+        key = self.auth_key_for_instance(platform, instance_number)
+        result = self.auth.refresh_login(platform, key, report)
+        self._record_auth_check_result(platform, instance_number, result)
 
     def _begin_live_check_result(self, instance_number: int) -> None:
         report = self._ensure_instance_report(instance_number)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        report["last_action"] = "Check Live"
+        report["last_action"] = "Check Login"
         report["last_status"] = "Checking"
-        report["last_note"] = "Checking account session..."
+        report["last_note"] = "Checking saved authorization..."
         report["account_status"] = "Checking"
-        report["account_reason"] = "Checking account session..."
+        report["account_reason"] = "Checking saved authorization..."
         report["account_checked_at"] = now
         report["last_updated"] = now
         if hasattr(self.app, "refresh_report_table_async"):
             self.app.refresh_report_table_async()
+
+    def auth_key_for_instance(self, platform: str, instance_number: int) -> str:
+        report = self._ensure_instance_report(instance_number)
+        firefox_profile = f"Firefox {instance_number}"
+        local_account = str(
+            report.get("local_account")
+            or self.state.instance_names.get(instance_number)
+            or firefox_profile
+        ).strip()
+        return f"{platform}|{firefox_profile}|{local_account}"
+
+    def save_auth_for_instance(self, platform: str, instance_number: int, auth: dict) -> None:
+        key = self.auth_key_for_instance(platform, instance_number)
+        self.auth.save_auth(platform, key, auth)
+        report = self._ensure_instance_report(instance_number)
+        report["auth_key"] = key
+        report["account_status"] = "Token Valid"
+        report["account_reason"] = "Encrypted authorization saved"
+        report["account_checked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._apply_platform_auth_field(platform, report, "Token Valid")
+        self.save_instance_data()
+        if hasattr(self.app, "refresh_report_table_async"):
+            self.app.refresh_report_table_async()
+
+    def clear_auth_for_instance(self, platform: str, instance_number: int) -> bool:
+        key = self.auth_key_for_instance(platform, instance_number)
+        removed = self.auth.clear_auth(platform, key)
+        report = self._ensure_instance_report(instance_number)
+        report["account_status"] = "Need Reconnect"
+        report["account_reason"] = "Encrypted authorization token cleared"
+        report["account_checked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._apply_platform_auth_field(platform, report, "Need Reconnect")
+        self.save_instance_data()
+        if hasattr(self.app, "refresh_report_table_async"):
+            self.app.refresh_report_table_async()
+        return removed
+
+    def refresh_login_for_instances(self, instance_numbers: list[int] | None = None, platform: str | None = None) -> None:
+        platform = platform or self.vars.platform_var.get()
+        targets = instance_numbers or self.active_instance_numbers()
+        for instance_number in targets:
+            self.check_live_instance(instance_number, platform)
+        self.save_instance_data()
+        self.app.refresh_dashboard()
+
+    def _record_auth_check_result(
+        self,
+        platform: str,
+        instance_number: int,
+        result: AuthCheckResult,
+    ) -> None:
+        if result.tokens:
+            self.auth.save_auth(platform, self.auth_key_for_instance(platform, instance_number), result.tokens)
+        status = result.status or ("Live" if result.success else "Need Reconnect")
+        color = self._auth_status_color(status)
+        report = self._ensure_instance_report(instance_number)
+        self._apply_platform_auth_field(platform, report, status)
+        self._record_live_check_result(instance_number, status, color, result.reason)
+
+    def _apply_platform_auth_field(self, platform: str, report: dict, status: str) -> None:
+        if platform == "facebook":
+            report["facebook_session"] = status
+        elif platform == "tiktok":
+            report["tiktok_session"] = status
+        elif platform == "youtube":
+            report["gmail_login"] = status
+            report["youtube_session"] = status
+        elif platform == "instagram":
+            report["instagram_session"] = status
+        elif platform == "wordpress":
+            report["api_login_status"] = status
+
+    def _auth_status_color(self, status: str) -> str:
+        normalized = str(status or "").strip().lower()
+        if normalized in {"live", "token valid"}:
+            return SUCCESS
+        if normalized in {"need reconnect", "token expired", "login required", "unknown", "queued", "checking"}:
+            return WARNING
+        return DANGER
 
     def _sync_identity_from_open_browser(self, instance_number: int) -> None:
         driver = self.state.drivers.get(instance_number)
@@ -979,85 +1071,8 @@ class InstanceManager:
         return changed
 
     def _check_live_instance_background(self, instance_number: int, platform: str) -> tuple[str, str, str]:
-        report = self._ensure_instance_report(instance_number)
-        proxy_url = self._normalized_proxy_url(str(report.get("proxy", "") or ""))
-        if proxy_url == "unsupported":
-            return "Review", "Saved proxy uses an unsupported scheme for background check.", WARNING
-        opener = self._build_background_opener(proxy_url)
-        self._autofill_route_ip_country(instance_number, opener)
-        report = self._ensure_instance_report(instance_number)
-        expected_country = self.expected_country_for_instance(instance_number)
-        current_country = str(report.get("country") or "").strip()
-        if expected_country:
-            if current_country and not self._countries_match(current_country, expected_country):
-                account_type = str(report.get("account_type") or expected_country).strip()
-                return (
-                    "IP Mismatch",
-                    (
-                        f"{account_type} account expects {expected_country} IP, "
-                        f"but current IP country is {current_country}. "
-                        "Stopped before live check; cookies were not loaded."
-                    ),
-                    DANGER,
-                )
-            if not current_country:
-                return (
-                    "IP unknown",
-                    f"Could not verify current IP country before checking {expected_country} account.",
-                    WARNING,
-                )
-
-        cookies = self._load_session_cookies(instance_number, platform)
-        if not cookies:
-            browser_result = self._classify_running_browser_session(instance_number, platform)
-            if browser_result:
-                return browser_result
-            return "Unknown", "No saved cookies found; open/login this profile first, then run Check Live.", WARNING
-
-        if not self._has_required_login_cookie(platform, cookies):
-            browser_result = self._classify_running_browser_session(instance_number, platform)
-            if browser_result and browser_result[0] in {"Disabled", "Checkpoint", "Live"}:
-                return browser_result
-            return "Login required", f"{self._platform_label(platform)} login cookie was not found.", DANGER
-
-        url = self.PLATFORM_CHECK_URLS.get(platform, self.PLATFORM_HOME_URLS.get(platform, "https://www.google.com"))
-        if platform == "facebook" and str(cookies.get("c_user") or "").strip().isdigit():
-            if not str(report.get("account_id") or "").strip():
-                report["account_id"] = str(cookies["c_user"]).strip()
-        headers = {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Cookie": self._cookie_header(cookies),
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) "
-                "Gecko/20100101 Firefox/126.0"
-            ),
-        }
-        request = urllib.request.Request(url, headers=headers)
-        try:
-            with opener.open(request, timeout=20) as response:
-                final_url = str(response.geturl() or "")
-                status_code = int(getattr(response, "status", 0) or response.getcode() or 0)
-                body = response.read(600000).decode("utf-8", errors="ignore")
-                self._autofill_identity_from_background_body(instance_number, body)
-                if platform == "facebook":
-                    self._autofill_facebook_details_background(instance_number, opener, headers, cookies)
-                    self._autofill_facebook_details_headless_if_needed(instance_number, cookies)
-        except urllib.error.HTTPError as exc:
-            final_url = str(exc.geturl() or url)
-            status_code = int(exc.code or 0)
-            try:
-                body = exc.read(300000).decode("utf-8", errors="ignore")
-                self._autofill_identity_from_background_body(instance_number, body)
-                if platform == "facebook":
-                    self._autofill_facebook_details_background(instance_number, opener, headers, cookies)
-                    self._autofill_facebook_details_headless_if_needed(instance_number, cookies)
-            except Exception:
-                body = ""
-        except Exception as exc:
-            return "Check error", f"Background check failed: {exc}", DANGER
-
-        return self._classify_http_session(platform, final_url, status_code, body, cookies)
+        result = self.auth.refresh_login(platform, self.auth_key_for_instance(platform, instance_number), self._ensure_instance_report(instance_number))
+        return result.status, result.reason, self._auth_status_color(result.status)
 
     def _autofill_facebook_details_background(
         self,
@@ -1150,27 +1165,7 @@ class InstanceManager:
                     pass
 
     def _add_facebook_cookies_to_driver(self, driver, cookies: dict[str, str]) -> None:
-        for name, value in cookies.items():
-            clean_name = str(name or "").strip()
-            clean_value = str(value or "").strip()
-            if not clean_name or not clean_value:
-                continue
-            cookie_data = {
-                "name": clean_name,
-                "value": clean_value,
-                "path": "/",
-                "secure": True,
-            }
-            if not clean_name.startswith("__Host-"):
-                cookie_data["domain"] = ".facebook.com"
-            try:
-                driver.add_cookie(cookie_data)
-            except Exception:
-                try:
-                    cookie_data.pop("domain", None)
-                    driver.add_cookie(cookie_data)
-                except Exception:
-                    continue
+        logging.info("Cookie injection is disabled; no Facebook cookies were added to the browser.")
 
     def _wait_for_rendered_accounts_center_text(self, driver) -> str:
         body_text = ""
@@ -1619,10 +1614,8 @@ class InstanceManager:
         return bool(cookies)
 
     def _load_session_cookies(self, instance_number: int, platform: str) -> dict[str, str]:
-        cookies: dict[str, str] = {}
-        cookies.update(self._load_json_cookie_file(instance_number, platform))
-        cookies.update(self._load_firefox_sqlite_cookies(instance_number, platform))
-        return {name: value for name, value in cookies.items() if name and value}
+        logging.info("Cookie extraction is disabled; using official authorization status only.")
+        return {}
 
     def _load_json_cookie_file(self, instance_number: int, platform: str) -> dict[str, str]:
         cookie_path = self._cookie_file_for_platform(instance_number, platform)
@@ -1740,7 +1733,7 @@ class InstanceManager:
         if str(status or "").strip().lower() in {"ip mismatch", "ip unknown"}:
             report["last_action"] = "Stop"
         else:
-            report["last_action"] = "Check Live"
+            report["last_action"] = "Check Login"
         if str(status or "").strip().lower() == "live" and not self._has_report_value(report.get("gmail")):
             report["gmail"] = "No Gmail"
         report["last_status"] = status
@@ -1800,12 +1793,6 @@ class InstanceManager:
             return "Checkpoint", "Platform is asking for verification/checkpoint.", DANGER
 
         if platform == "facebook":
-            has_c_user = False
-            try:
-                cookie = driver.get_cookie("c_user")
-                has_c_user = bool(cookie and str(cookie.get("value", "")).strip().isdigit())
-            except Exception:
-                has_c_user = False
             login_form_markers = (
                 'name="email"',
                 'id="email"',
@@ -1815,10 +1802,10 @@ class InstanceManager:
             )
             if "facebook.com/login" in current_url or "/checkpoint/" in current_url:
                 return "Login required", "Facebook session is not logged in or needs checkpoint.", DANGER
-            if any(marker in body for marker in login_form_markers) or not has_c_user:
-                return "Login required", "Facebook c_user session cookie was not found.", DANGER
+            if any(marker in body for marker in login_form_markers):
+                return "Login required", "Facebook login form is visible in this browser profile.", DANGER
             if "facebook.com" in current_url and "login" not in current_url:
-                return "Live", "Facebook c_user session opened without checkpoint or disabled screen.", SUCCESS
+                return "Live", "Facebook opened without checkpoint or disabled screen.", SUCCESS
         elif platform == "tiktok":
             if "login" in current_url or "login to tiktok" in body:
                 return "Login required", "TikTok session is not logged in.", DANGER
@@ -2245,8 +2232,8 @@ class InstanceManager:
                 local_index = self._next_local_index_for_type(account_type)
             if proxy and not ip_address:
                 ip_address = self._proxy_host(proxy)
-            status = clean_row.get("status") or "Idle"
-            password = clean_row.get("password") or clean_row.get("api_token") or clean_row.get("application_password")
+            status = clean_row.get("status") or "Need Reconnect"
+            api_token = clean_row.get("api_token") or clean_row.get("application_password")
 
             while next_instance in self.state.deleted_instances:
                 next_instance += 1
@@ -2258,17 +2245,13 @@ class InstanceManager:
             self.open_firefox_instances(1, start_index=next_instance)
             if profile_name:
                 self.state.profile_names[next_instance] = profile_name
-            if password:
-                self.state.credentials_dict[next_instance] = password
             report = self._ensure_instance_report(next_instance)
             report["platform"] = platform
             if account_id:
                 report["account_id"] = account_id
-            if clean_row.get("two_fa"):
-                report["two_fa"] = clean_row.get("two_fa")
             if gmail:
                 report["gmail"] = gmail
-                report["gmail_login"] = "Saved"
+                report["gmail_login"] = "Need Reconnect"
             if date_birth:
                 report["date_birth"] = date_birth
             if gender:
@@ -2291,17 +2274,17 @@ class InstanceManager:
             if platform == "tiktok":
                 report["tiktok_username"] = clean_row.get("tiktok_username") or clean_row.get("username") or profile_name
                 report["tiktok_user_id"] = clean_row.get("tiktok_user_id") or account_id
-                report["tiktok_session"] = "Imported"
+                report["tiktok_session"] = "Need Reconnect"
             elif platform == "youtube":
                 report["youtube_channel_name"] = clean_row.get("channel_name") or profile_name
                 report["channel_id"] = clean_row.get("channel_id") or account_id
                 report["channel_url"] = clean_row.get("channel_url", "")
                 report["brand_channel"] = clean_row.get("brand_channel") or "-"
-                report["gmail_login"] = "Saved" if gmail else "-"
+                report["gmail_login"] = "Need Reconnect" if gmail else "-"
             elif platform == "instagram":
                 report["instagram_username"] = clean_row.get("instagram_username") or clean_row.get("username") or profile_name
                 report["instagram_user_id"] = clean_row.get("instagram_user_id") or account_id
-                report["instagram_session"] = "Imported"
+                report["instagram_session"] = "Need Reconnect"
             elif platform == "wordpress":
                 site_url = clean_row.get("site_url") or clean_row.get("wordpress_site_url")
                 report["wordpress_site_url"] = site_url
@@ -2310,7 +2293,20 @@ class InstanceManager:
                 report["author_name"] = clean_row.get("author_name") or report["wordpress_username"]
                 report["posting_type"] = clean_row.get("posting_type") or "Article"
                 report["default_category"] = clean_row.get("default_category") or "-"
-                report["api_login_status"] = "Imported token" if password else "Login required"
+                report["api_login_status"] = "Token Valid" if api_token else "Need Reconnect"
+                if api_token:
+                    self.auth.save_auth(
+                        platform,
+                        self.auth_key_for_instance(platform, next_instance),
+                        {
+                            "site_url": site_url,
+                            "username": report["wordpress_username"],
+                            "application_password": api_token,
+                        },
+                    )
+                    status = "Token Valid"
+            elif platform == "facebook":
+                report["facebook_session"] = "Need Reconnect"
             report["last_action"] = "Imported"
             report["last_status"] = status
             report["account_status"] = status
@@ -2884,7 +2880,18 @@ class InstanceManager:
         report["account_checked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if clean_reason:
             report["last_note"] = clean_reason
-        if clean_status in {"Live", "Checkpoint", "Disabled", "Login required", "Review", "Check error", "Launch failed"}:
+        if clean_status in {
+            "Live",
+            "Token Valid",
+            "Token Expired",
+            "Need Reconnect",
+            "Checkpoint",
+            "Disabled",
+            "Login required",
+            "Review",
+            "Check error",
+            "Launch failed",
+        }:
             report["last_status"] = clean_status
         if save_data:
             self.save_instance_data()
@@ -3221,8 +3228,8 @@ class InstanceManager:
             return note
         if effective_status == "Unknown":
             if str(report.get("account_id") or "").strip():
-                return "Saved identity only; run Check Live for real state."
-            return "Run Check Live for real state."
+                return "Saved identity only; run Check Login for token/API state."
+            return "Run Check Login for token/API state."
         return "-"
 
     def _is_weak_live_report(self, report: dict) -> bool:
@@ -3237,44 +3244,13 @@ class InstanceManager:
         reason = str(text or "").strip().lower()
         weak_markers = (
             "account id saved",
-            "c_user cookie exists",
             "login detected in browser session",
             "identity was read",
         )
         return any(marker in reason for marker in weak_markers)
 
     def _hydrate_reports_from_cookie_files(self) -> None:
-        if self.vars.platform_var.get() != "facebook":
-            return
-        changed = False
-        for cookie_file in COOKIE_DIR.glob("cookies_*.json"):
-            match = re.search(r"cookies_(\d+)\.json$", cookie_file.name)
-            if not match:
-                continue
-            instance_number = int(match.group(1))
-            if instance_number in self.state.deleted_instances:
-                continue
-
-            report = self._ensure_instance_report(instance_number)
-
-            try:
-                with cookie_file.open("r", encoding="utf-8") as handle:
-                    cookies = json.load(handle)
-            except Exception:
-                continue
-
-            for cookie in cookies if isinstance(cookies, list) else []:
-                if str(cookie.get("name", "")).strip() != "c_user":
-                    continue
-                cookie_value = str(cookie.get("value", "")).strip()
-                if cookie_value.isdigit():
-                    if not str(report.get("account_id", "") or "").strip():
-                        report["account_id"] = cookie_value
-                        changed = True
-                    break
-
-        if changed:
-            self.save_instance_data()
+        return
 
     def _update_instance_report(
         self,

@@ -1,7 +1,7 @@
 {
   "platform": "instagram",
   "title": "Instagram Workspace",
-  "import_format": "Username|Password|2FA|Proxy|InstagramUsername|InstagramUserID",
+  "import_format": "InstagramUsername|InstagramUserID|Proxy|ExpectedCountry",
   "country_types": [
     "All",
     "Cambodia",

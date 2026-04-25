@@ -1,7 +1,7 @@
 {
   "platform": "tiktok",
   "title": "TikTok Workspace",
-  "import_format": "Username|Password|2FA|Proxy|TikTokUsername|TikTokUserID",
+  "import_format": "TikTokUsername|TikTokUserID|Proxy|ExpectedCountry",
   "country_types": [
     "All",
     "Cambodia",

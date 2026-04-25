@@ -1,7 +1,7 @@
 {
   "platform": "youtube",
   "title": "YouTube Workspace",
-  "import_format": "Gmail|Password|2FA|Proxy|ChannelName|ChannelID|ChannelURL",
+  "import_format": "Gmail|ChannelName|ChannelID|ChannelURL|Proxy|ExpectedCountry",
   "country_types": [
     "All",
     "Cambodia",

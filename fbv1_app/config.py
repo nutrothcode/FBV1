@@ -81,6 +81,10 @@ def platform_settings_path(platform: str) -> Path:
     return platform_data_dir(platform) / "settings.json"
 
 
+def platform_auth_tokens_path(platform: str) -> Path:
+    return platform_data_dir(platform) / "auth_tokens.enc"
+
+
 def avatar_image_path(instance_number: int) -> Path:
     return image_account_dir(instance_number) / "avatar.png"
 

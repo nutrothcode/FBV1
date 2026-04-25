@@ -428,7 +428,7 @@ class FacebookToolApp:
         self.phone_mode_button = self.create_button(tool_bar, "Phone Mode", lambda: self._set_browser_mode("phone"), "neutral", True)
         self.phone_mode_button.pack(side=LEFT, padx=(0, 10))
         self.create_button(tool_bar, "Find Acc", self._search_report_table, "secondary", True).pack(side=LEFT, padx=(0, 4))
-        check_live_button = self.create_button(tool_bar, "Check Live", self._run_manual_check_live, "primary", True)
+        check_live_button = self.create_button(tool_bar, "Check Login", self._run_manual_check_live, "primary", True)
         check_live_button.pack(side=LEFT, padx=(0, 4))
         check_live_button._check_live_pack_info = check_live_button.pack_info()
         self.check_live_buttons.append(check_live_button)
@@ -645,7 +645,7 @@ class FacebookToolApp:
         self.monitor_tab_button.pack(side=LEFT, padx=(6, 0))
         check_live_button = self.create_button(
             toolbar,
-            text="Check Live",
+            text="Check Login",
             command=self._run_manual_check_live,
             kind="primary",
             compact=True,
@@ -1079,8 +1079,8 @@ class FacebookToolApp:
             return
         account_type = self._selected_account_type()
         if not account_type:
-            self._set_legacy_status("Select one account type before Check Live")
-            self.messagebox.showwarning("Check Live", "Select one account type first. Check Live is disabled for All.")
+            self._set_legacy_status("Select one account type before Check Login")
+            self.messagebox.showwarning("Check Login", "Select one account type first. Check Login is disabled for All.")
             return
         self.instances.check_live_all_instances(show_empty_warning=True, account_type=account_type)
 
@@ -1144,6 +1144,10 @@ class FacebookToolApp:
             self.report_tree.selection_set(row_id)
         menu = tk.Menu(self.root, tearoff=False)
         menu.add_command(label="Open Browser Profile", command=self._open_selected_report_profile)
+        menu.add_command(label="Connect Account", command=self.connect_account)
+        menu.add_command(label="Refresh Login", command=self.refresh_login_selected)
+        menu.add_command(label="Check Login", command=self.refresh_login_selected)
+        menu.add_command(label="Clear Token", command=self.clear_selected_auth_tokens)
         if self.vars.platform_var.get() == "facebook":
             menu.add_command(label="Copy UID", command=self._copy_selected_report_uid)
         menu.add_command(label="Copy Row", command=self._copy_selected_report_row)
@@ -1362,6 +1366,7 @@ class FacebookToolApp:
             "password": "password",
             "2fa": "two_fa",
             "proxy": "proxy",
+            "expectedcountry": "expected_country",
             "facebookname": "facebook_name",
             "facebookid": "facebook_id",
             "tiktokusername": "tiktok_username",
@@ -1392,7 +1397,12 @@ class FacebookToolApp:
                 ("Generate Firefox Instances", self.instances.generate_firefox_instances, "primary"),
                 ("Import Accounts", self.import_accounts_file, "secondary"),
                 ("Export Report", self.export_report_file, "secondary"),
-                ("Enter Credentials", self.enter_credentials, "secondary"),
+                ("Connect Account", self.connect_account, "secondary"),
+                ("Refresh Login", self.refresh_login_selected, "secondary"),
+                ("Check Login", self.refresh_login_selected, "secondary"),
+                ("Open Platform Home", self._open_selected_report_profile, "secondary"),
+                ("Reconnect Required", self.show_reconnect_required, "warning"),
+                ("Clear Token", self.clear_selected_auth_tokens, "danger"),
                 ("Photo/Cover Setup", self._open_photo_cover_setup_window, "secondary"),
                 ("Open Folder", self.instances.open_data_folder, "neutral"),
                 ("Start All", self.instances.start_all_instances, "success"),
@@ -1466,7 +1476,7 @@ class FacebookToolApp:
         add_by_combo = ttk.Combobox(
             add_by,
             textvariable=self.legacy_add_by_var,
-            values=("Account", "Cookie", "Profile"),
+            values=("Account", "OAuth/API", "Profile"),
             state="readonly",
             width=16,
         )
@@ -1475,7 +1485,7 @@ class FacebookToolApp:
 
         Label(
             self.sidebar,
-            text="Format Login: Mail|AccID|Pwd|2FA|Proxy",
+            text="Format Login: use platform import format; no passwords, 2FA, or cookies",
             bg=SURFACE_BG,
             fg=TEXT_MUTED,
             font=SMALL_FONT,
@@ -2687,131 +2697,127 @@ class FacebookToolApp:
                 )
 
     def enter_credentials(self) -> None:
-        credentials_window = self.create_modal("Enter Credentials", "760x560")
-        body = self.create_modal_card(
-            credentials_window,
-            "Account Credentials",
-            "Edit saved credentials in the format email|password|2fa.",
-        )
+        self.connect_account()
 
-        canvas = Canvas(body, bg=SURFACE_BG, bd=0, highlightthickness=0)
-        scroll_y = Scrollbar(body, orient="vertical", command=canvas.yview)
-        frame = Frame(canvas, bg=SURFACE_BG)
-        self.state.credential_entries.clear()
+    def connect_account(self) -> None:
+        platform = self.vars.platform_var.get()
+        selected = self._selected_report_instance_numbers()
+        if not selected:
+            selected = self.instances.active_instance_numbers()[:1]
+        if not selected:
+            self.messagebox.showwarning("Connect Account", "Select or create an account row first.")
+            return
+        instance_number = selected[0]
+        title, help_text = self._connect_copy(platform)
+        connect_window = self.create_modal(title, "760x520")
+        body = self.create_modal_card(connect_window, title, help_text)
 
-        max_instance = max(
-            (i for i in range(1, len(self.state.firefox_buttons) + 1) if i not in self.state.deleted_instances),
-            default=0,
-        )
-        for instance_number in range(1, max_instance + 1):
-            if instance_number in self.state.deleted_instances:
-                continue
+        Label(
+            body,
+            text=f"Selected: Firefox {instance_number}",
+            bg=SURFACE_BG,
+            fg=TEXT_PRIMARY,
+            font=SECTION_FONT,
+        ).pack(anchor="w", pady=(0, 10))
 
-            row = Frame(frame, bg=SURFACE_ALT, highlightbackground=BORDER, highlightthickness=1)
-            row.pack(fill=X, pady=6)
-            Label(
-                row,
-                text=f"Firefox {instance_number}",
-                bg=SURFACE_ALT,
-                fg=TEXT_PRIMARY,
-                font=SECTION_FONT,
-                width=14,
-                anchor="w",
-            ).pack(side=LEFT, padx=(12, 8), pady=10)
-            entry = Entry(row)
+        fields: dict[str, Entry | tk.Text] = {}
+
+        def add_entry(key: str, label: str, value: str = "", show: str | None = None) -> None:
+            Label(body, text=label, bg=SURFACE_BG, fg=TEXT_MUTED, font=SMALL_FONT).pack(anchor="w", pady=(6, 2))
+            entry = Entry(body, show=show or "")
             self.style_entry(entry)
-            entry.pack(side=LEFT, fill=X, expand=True, padx=(0, 12), pady=10)
-            entry.insert(0, self.state.credentials_dict.get(instance_number, ""))
-            self.state.credential_entries[instance_number] = entry
+            entry.insert(0, value)
+            entry.pack(fill=X)
+            fields[key] = entry
 
-        frame.update_idletasks()
-        canvas.create_window(0, 0, anchor="nw", window=frame)
-        canvas.update_idletasks()
-        canvas.config(scrollregion=canvas.bbox("all"), yscrollcommand=scroll_y.set)
-        canvas.pack(fill=BOTH, expand=True, side=LEFT)
-        scroll_y.pack(fill=Y, side=RIGHT, padx=(10, 0))
+        report = self.instances.state.instance_reports.get(instance_number, {})
+        if platform == "wordpress":
+            add_entry("site_url", "WordPress Site URL", str(report.get("wordpress_site_url") or ""))
+            add_entry("username", "WordPress Username", str(report.get("wordpress_username") or ""))
+            add_entry("application_password", "Application Password / API Token", show="*")
+        else:
+            add_entry("access_token", "OAuth Access Token")
+            add_entry("refresh_token", "OAuth Refresh Token (when issued)")
+            add_entry("expires_at", "Expires At Unix Time (optional)")
 
         footer = Frame(body, bg=SURFACE_BG)
-        footer.pack(fill=X, pady=(16, 0))
-        self.create_button(footer, "Save", self.save_credentials, kind="primary").pack(side=LEFT)
-        self.create_button(footer, "Paste Input", self.open_input_window, kind="secondary").pack(side=LEFT, padx=8)
-        self.create_button(footer, "Export Excel", self.export_credentials_to_excel, kind="neutral").pack(side=LEFT)
+        footer.pack(fill=X, pady=(18, 0))
+
+        def save_auth() -> None:
+            auth: dict[str, str] = {}
+            for key, widget in fields.items():
+                value = widget.get().strip() if isinstance(widget, Entry) else widget.get("1.0", tk.END).strip()
+                if value:
+                    auth[key] = value
+            if not auth:
+                self.messagebox.showwarning("Connect Account", "No authorization data entered.")
+                return
+            self.instances.save_auth_for_instance(platform, instance_number, auth)
+            self.messagebox.showinfo("Connect Account", "Encrypted authorization saved.")
+            connect_window.destroy()
+
+        self.create_button(footer, "Save Encrypted", save_auth, kind="primary").pack(side=LEFT)
+        self.create_button(
+            footer,
+            "Open Platform Home",
+            lambda: self.instances.open_platform_action(instance_number, "open_home", platform),
+            kind="secondary",
+        ).pack(side=LEFT, padx=8)
+
+    def _connect_copy(self, platform: str) -> tuple[str, str]:
+        if platform == "facebook":
+            return (
+                "Connect Facebook",
+                "Connect with official Meta Login or open Facebook in this Firefox profile. The app does not store your Facebook password.",
+            )
+        if platform == "tiktok":
+            return (
+                "Connect TikTok",
+                "Connect with TikTok Login Kit/OAuth. The app stores only encrypted tokens, not your TikTok password.",
+            )
+        if platform == "youtube":
+            return (
+                "Connect YouTube / Gmail",
+                "Connect with Google OAuth. The app stores encrypted refresh token, not Gmail password.",
+            )
+        if platform == "instagram":
+            return (
+                "Connect Instagram",
+                "Connect with official Meta/Instagram authorization. The app does not store Instagram password.",
+            )
+        return (
+            "Connect WordPress",
+            "Use WordPress Site URL, username, and Application Password/API token. Store encrypted.",
+        )
+
+    def refresh_login_selected(self) -> None:
+        selected = self._selected_report_instance_numbers()
+        if not selected:
+            selected = self.instances.active_instance_numbers()
+        self.instances.refresh_login_for_instances(selected, self.vars.platform_var.get())
+
+    def clear_selected_auth_tokens(self) -> None:
+        selected = self._selected_report_instance_numbers()
+        if not selected:
+            self.messagebox.showwarning("Clear Token", "Select at least one account row first.")
+            return
+        platform = self.vars.platform_var.get()
+        for instance_number in selected:
+            self.instances.clear_auth_for_instance(platform, instance_number)
+        self.messagebox.showinfo("Clear Token", f"Cleared encrypted token for {len(selected)} account(s).")
+
+    def show_reconnect_required(self) -> None:
+        self.legacy_find_var.set("Need Reconnect")
+        self.refresh_report_table()
 
     def save_credentials(self) -> None:
-        self.instances.save_credentials_from_entries()
-        messagebox.showinfo("Success", "Credentials successfully saved!")
+        self.messagebox.showinfo("Disabled", "Plaintext password storage is disabled. Use Connect Account.")
 
     def open_input_window(self) -> None:
-        input_window = self.create_modal("Paste Accounts", "760x440")
-        body = self.create_modal_card(
-            input_window,
-            "Bulk Account Import",
-            "Paste one account per line with: instance_id<TAB>credential.",
-        )
-
-        input_text = tk.Text(
-            body,
-            width=100,
-            height=18,
-            bg=INPUT_BG,
-            fg=TEXT_PRIMARY,
-            insertbackground=TEXT_PRIMARY,
-            relief="flat",
-            font=BODY_FONT,
-            highlightthickness=1,
-            highlightbackground=BORDER,
-            highlightcolor=ACCENT,
-        )
-        input_text.pack(fill=BOTH, expand=True)
-
-        def save_input() -> None:
-            pasted_text = input_text.get("1.0", tk.END).strip().split("\n")
-            for line in pasted_text:
-                parts = line.split("\t")
-                if len(parts) != 2:
-                    continue
-                instance_number = int(parts[0])
-                credential = parts[1]
-                self.state.credentials_dict[instance_number] = credential
-                if instance_number in self.state.credential_entries:
-                    entry = self.state.credential_entries[instance_number]
-                    entry.delete(0, tk.END)
-                    entry.insert(0, credential)
-
-            self.instances.save_instance_data()
-            input_window.destroy()
-
-        footer = Frame(body, bg=SURFACE_BG)
-        footer.pack(fill=X, pady=(14, 0))
-        self.create_button(footer, "Save Import", save_input, kind="primary").pack(side=LEFT)
+        self.messagebox.showinfo("Disabled", "Bulk credential paste is disabled. Use Import Accounts without passwords.")
 
     def export_credentials_to_excel(self) -> None:
-        export_window = self.create_modal("Export Credentials", "420x220")
-        body = self.create_modal_card(
-            export_window,
-            "Export to Excel",
-            "Enter a range like 1-50 to export saved credentials.",
-        )
-
-        range_entry = Entry(body)
-        self.style_entry(range_entry, width=28)
-        range_entry.pack(anchor="w")
-
-        def export() -> None:
-            range_str = range_entry.get().strip()
-            try:
-                start, end = map(int, range_str.split("-"))
-                data = {"ID": [], "Account": []}
-                for i in range(start, end + 1):
-                    if i in self.state.credentials_dict:
-                        data["ID"].append(i)
-                        data["Account"].append(self.state.credentials_dict[i])
-                pd.DataFrame(data).to_excel("account.xlsx", index=False)
-                messagebox.showinfo("Success", "Credentials exported successfully!")
-            except Exception as exc:
-                messagebox.showerror("Error", f"Failed to export credentials: {exc}")
-
-        self.create_button(body, "Export", export, kind="primary").pack(anchor="w", pady=(14, 0))
+        self.messagebox.showinfo("Disabled", "Credential export is disabled for passwords, 2FA, cookies, and tokens.")
 
     def _open_photo_cover_setup_window(self) -> None:
         setup_window = self.create_modal("Photo/Cover Setup", "980x620")

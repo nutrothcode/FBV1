@@ -156,8 +156,6 @@ class BrowserManager:
             if start_url:
                 logging.info("Firefox %s opened %s.", instance_number, initial_url)
             elif login:
-                self.load_cookies(driver, instance_number)
-                driver.get("https://www.facebook.com")
                 self.prepare_login(instance_number)
             else:
                 logging.info("Firefox %s is ready for action.", instance_number)
@@ -475,103 +473,21 @@ class BrowserManager:
             self.app.instances.set_run_status(instance_number, "Not running", DANGER)
             return
 
-        credentials = self.state.credentials_dict.get(instance_number)
-        if not credentials:
-            logging.info("No credentials saved for Firefox %s. Please log in manually if needed.", instance_number)
-            driver.get("https://www.facebook.com")
-            self.app.instances.set_preview_status(instance_number, "Waiting for manual login...", TEXT_MUTED)
-            self.app.instances.set_run_status(instance_number, "Waiting login", WARNING)
-            self._start_manual_login_monitor(instance_number)
-            return
-
         try:
-            email, password, two_fa = credentials.split("|")
-        except ValueError:
-            logging.error("Credentials format should be 'email|password|2fa'")
-            self.state.run_summary.append(f"Firefox {instance_number}: Error")
-            self.app.instances.set_run_status(instance_number, "Credential format error", DANGER)
-            return
-
-        try:
-            driver.get("https://www.facebook.com")
-            if "checkpoint" in driver.current_url:
-                logging.info("Please resolve the checkpoint manually.")
-                self.state.run_summary.append(f"Firefox {instance_number}: Error")
-                self.app.instances.set_run_status(instance_number, "Checkpoint required", WARNING)
-                return
-
-            email_field = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "email")))
-            password_field = driver.find_element(By.ID, "pass")
-            email_field.send_keys(email)
-            password_field.send_keys(password)
-            driver.find_element(By.NAME, "login").click()
-
-            if two_fa:
-                two_fa_code = self.get_2fa_code(two_fa, driver)
-                if not two_fa_code:
-                    logging.error("Please copy code 2fa and continue login Facebook.")
-                    self.state.run_summary.append(f"Firefox {instance_number}: Error")
-                    return
-
-                try:
-                    two_fa_field = WebDriverWait(driver, 10).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, "input[autocomplete='off'][type='text']"))
-                    )
-                    two_fa_field.send_keys(two_fa_code)
-                    WebDriverWait(driver, 10).until(
-                        EC.element_to_be_clickable((By.ID, "checkpointSubmitButton"))
-                    ).click()
-
-                    try:
-                        WebDriverWait(driver, 10).until(
-                            EC.element_to_be_clickable((By.ID, "checkpointSubmitButton"))
-                        ).click()
-                    except Exception:
-                        logging.info("Please complete any additional steps manually.")
-                except Exception as exc:
-                    logging.error("2FA code entry failed: %s", exc)
-                    self.state.run_summary.append(f"Firefox {instance_number}: Error")
-                    self.app.instances.set_preview_status(instance_number, "Waiting for manual login...", TEXT_MUTED)
-                    self.app.instances.set_run_status(instance_number, "2FA/manual login", WARNING)
-                    self._start_manual_login_monitor(instance_number)
-            else:
-                self.save_cookies(driver, instance_number)
-                logging.info("Please complete the login process manually for Firefox %s.", instance_number)
-                self.app.instances.set_preview_status(instance_number, "Waiting for manual login...", TEXT_MUTED)
-                self.app.instances.set_run_status(instance_number, "Waiting login", WARNING)
-                self._start_manual_login_monitor(instance_number)
+            platform = self.app.vars.platform_var.get()
+            url = self.app.instances.PLATFORM_HOME_URLS.get(platform, "https://www.facebook.com")
+            driver.get(url)
+            logging.info("Opened %s for Firefox %s. Password/2FA automation is disabled.", platform, instance_number)
+            self.app.instances.set_preview_status(instance_number, "Opened platform home", TEXT_MUTED)
+            self.app.instances.set_run_status(instance_number, "Manual/OAuth only", WARNING)
         except Exception as exc:
-            logging.error("Failed during login preparation: %s", exc)
+            logging.error("Failed opening platform home: %s", exc)
             self.state.run_summary.append(f"Firefox {instance_number}: Error")
-            self.app.instances.set_run_status(instance_number, "Login prepare failed", DANGER)
+            self.app.instances.set_run_status(instance_number, "Open failed", DANGER)
 
     def get_2fa_code(self, secret: str, driver) -> str | None:
-        try:
-            driver.execute_script("window.open('https://2fa.live/', '_blank');")
-            driver.switch_to.window(driver.window_handles[1])
-
-            WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "textarea#listToken.form-control"))
-            )
-            input_field = driver.find_element(By.CSS_SELECTOR, "textarea#listToken.form-control")
-            input_field.send_keys(secret)
-            driver.find_element(By.XPATH, "//a[@id='submit']").click()
-
-            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, "//a[@id='copy_btn']")))
-            driver.find_element(By.XPATH, "//a[@id='copy_btn']").click()
-
-            output_field = driver.find_element(By.CSS_SELECTOR, "textarea#output.form-control")
-            output_text = output_field.get_attribute("value")
-            two_fa_code = output_text.split("|")[-1].strip()
-            if not two_fa_code.isdigit() or len(two_fa_code) != 6:
-                raise ValueError("Unexpected format of the 2FA output")
-
-            driver.close()
-            driver.switch_to.window(driver.window_handles[0])
-            return two_fa_code
-        except Exception as exc:
-            logging.error("Error fetching 2FA code: %s", exc)
-            return None
+        logging.info("2FA automation is disabled. Complete authorization manually through the official provider.")
+        return None
 
     def get_id(self, instance_number: int) -> str | None:
         driver = self.state.drivers.get(instance_number)
@@ -668,16 +584,7 @@ class BrowserManager:
         return ""
 
     def _extract_account_id_from_driver(self, driver) -> str | None:
-        # Best source for logged-in sessions.
-        try:
-            cookie = driver.get_cookie("c_user")
-            cookie_value = str((cookie or {}).get("value", "")).strip()
-            if cookie_value.isdigit():
-                return cookie_value
-        except Exception:
-            pass
-
-        # Common fallback in profile URLs.
+        # Common source in profile URLs. Cookies are intentionally not read.
         url_id = self._extract_numeric_id_from_url(getattr(driver, "current_url", ""))
         if url_id:
             return url_id
@@ -1496,30 +1403,10 @@ class BrowserManager:
             logging.error("Error clearing data: %s", exc)
 
     def save_cookies(self, driver, instance_number: int) -> None:
-        cookie_file = self._cookie_file(instance_number)
-        with cookie_file.open("w", encoding="utf-8") as handle:
-            json.dump(driver.get_cookies(), handle)
-        logging.info("Cookies for Firefox %s saved successfully.", instance_number)
+        logging.info("Cookie export is disabled. Firefox %s cookies were not saved.", instance_number)
 
     def load_cookies(self, driver, instance_number: int) -> None:
-        cookie_file = self._cookie_file(instance_number)
-        if not cookie_file.exists():
-            logging.info("No cookies found for Firefox %s.", instance_number)
-            return
-
-        with cookie_file.open("r", encoding="utf-8") as handle:
-            cookies = json.load(handle)
-
-        for cookie in cookies:
-            prepared_cookie = dict(cookie)
-            if "expiry" in prepared_cookie:
-                prepared_cookie["expiry"] = int(prepared_cookie["expiry"])
-            try:
-                driver.add_cookie(prepared_cookie)
-            except Exception as exc:
-                logging.debug("Skipping cookie for Firefox %s: %s", instance_number, exc)
-
-        logging.info("Cookies for Firefox %s loaded successfully.", instance_number)
+        logging.info("Cookie import/injection is disabled. Firefox %s cookies were not loaded.", instance_number)
 
     def delete_cookie_file(self, instance_number: int) -> None:
         cookie_file = self._cookie_file(instance_number)
@@ -1586,12 +1473,6 @@ class BrowserManager:
         current_url = str(driver.current_url or "").lower()
         if "login" in current_url or "checkpoint" in current_url:
             return False
-        if self.app.vars.platform_var.get() == "facebook":
-            try:
-                cookie = driver.get_cookie("c_user")
-                return bool(cookie and str(cookie.get("value", "")).strip().isdigit())
-            except Exception:
-                return False
         return not driver.find_elements(By.ID, "email")
 
     def _start_manual_login_monitor(
@@ -1625,7 +1506,6 @@ class BrowserManager:
                             return
                         driver = self.state.drivers.get(instance_number)
                         if driver and self._is_logged_in(driver):
-                            self.save_cookies(driver, instance_number)
                             self.try_sync_profile_preview(instance_number)
                             self._sync_profile_identity_from_driver(instance_number, driver, restore_url=True)
                             self.app.instances.check_live_instance(instance_number, self.app.vars.platform_var.get())
@@ -2550,9 +2430,6 @@ class BrowserManager:
                 "Referer": driver.current_url,
                 "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
             }
-            cookies = "; ".join(f"{cookie['name']}={cookie['value']}" for cookie in driver.get_cookies())
-            if cookies:
-                headers["Cookie"] = cookies
             request = Request(normalized_url, headers=headers)
             with urlopen(request, timeout=20) as response:
                 data = response.read()

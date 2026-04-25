@@ -1,7 +1,7 @@
 {
   "platform": "facebook",
   "title": "Facebook Workspace",
-  "import_format": "Mail|Password|2FA|Proxy|FacebookName|FacebookID",
+  "import_format": "FacebookName|FacebookID|Proxy|ExpectedCountry",
   "country_types": [
     "All",
     "Cambodia",

@@ -10,7 +10,7 @@ PLATFORM_CONFIG: dict[str, dict[str, Any]] = {
         "folder": "data/facebook",
         "home_url": "https://www.facebook.com",
         "check_url": "https://www.facebook.com/me",
-        "import_format": "Mail|Password|2FA|Proxy|FacebookName|FacebookID",
+        "import_format": "FacebookName|FacebookID|Proxy|ExpectedCountry",
         "columns": [
             ("instance", "Firefox", 100),
             ("local_account", "Local Account", 130),
@@ -29,7 +29,12 @@ PLATFORM_CONFIG: dict[str, dict[str, Any]] = {
             ("note", "Note", 220),
         ],
         "actions": [
-            ("Login", "login"),
+            ("Connect Account", "connect_account"),
+            ("Refresh Login", "refresh_login"),
+            ("Check Login", "check_login"),
+            ("Open Platform Home", "open_home"),
+            ("Reconnect Required", "reconnect_required"),
+            ("Clear Token", "clear_token"),
             ("Care", "care"),
             ("Clear Data", "clear_data"),
             ("Join Group", "join_group"),
@@ -48,7 +53,7 @@ PLATFORM_CONFIG: dict[str, dict[str, Any]] = {
         "folder": "data/tiktok",
         "home_url": "https://www.tiktok.com",
         "check_url": "https://www.tiktok.com",
-        "import_format": "Username|Password|2FA|Proxy|TikTokUsername|TikTokUserID",
+        "import_format": "TikTokUsername|TikTokUserID|Proxy|ExpectedCountry",
         "columns": [
             ("instance", "Firefox", 100),
             ("local_account", "Local Account", 130),
@@ -67,8 +72,12 @@ PLATFORM_CONFIG: dict[str, dict[str, Any]] = {
             ("note", "Note", 220),
         ],
         "actions": [
-            ("Open TikTok", "open_home"),
-            ("Check TikTok Login", "check_login"),
+            ("Connect Account", "connect_account"),
+            ("Refresh Login", "refresh_login"),
+            ("Check Login", "check_login"),
+            ("Open Platform Home", "open_home"),
+            ("Reconnect Required", "reconnect_required"),
+            ("Clear Token", "clear_token"),
             ("Publish Tool", "publish_tool"),
             ("Upload Video", "upload_video"),
             ("Profile", "open_profile"),
@@ -91,7 +100,7 @@ PLATFORM_CONFIG: dict[str, dict[str, Any]] = {
         "folder": "data/youtube",
         "home_url": "https://www.youtube.com",
         "check_url": "https://www.youtube.com",
-        "import_format": "Gmail|Password|2FA|Proxy|ChannelName|ChannelID|ChannelURL",
+        "import_format": "Gmail|ChannelName|ChannelID|ChannelURL|Proxy|ExpectedCountry",
         "columns": [
             ("instance", "Firefox", 100),
             ("local_account", "Local Account", 130),
@@ -112,9 +121,12 @@ PLATFORM_CONFIG: dict[str, dict[str, Any]] = {
             ("note", "Note", 220),
         ],
         "actions": [
-            ("Open YouTube", "open_home"),
-            ("Check Gmail Login", "check_gmail"),
-            ("Check YouTube Channel", "check_channel"),
+            ("Connect Account", "connect_account"),
+            ("Refresh Login", "refresh_login"),
+            ("Check Login", "check_login"),
+            ("Open Platform Home", "open_home"),
+            ("Reconnect Required", "reconnect_required"),
+            ("Clear Token", "clear_token"),
             ("YouTube Studio", "open_studio"),
             ("Upload Video", "upload_video"),
             ("Shorts", "open_shorts"),
@@ -137,7 +149,7 @@ PLATFORM_CONFIG: dict[str, dict[str, Any]] = {
         "folder": "data/instagram",
         "home_url": "https://www.instagram.com",
         "check_url": "https://www.instagram.com/accounts/edit/",
-        "import_format": "Username|Password|2FA|Proxy|InstagramUsername|InstagramUserID",
+        "import_format": "InstagramUsername|InstagramUserID|Proxy|ExpectedCountry",
         "columns": [
             ("instance", "Firefox", 100),
             ("local_account", "Local Account", 130),
@@ -156,8 +168,12 @@ PLATFORM_CONFIG: dict[str, dict[str, Any]] = {
             ("note", "Note", 220),
         ],
         "actions": [
-            ("Open Instagram", "open_home"),
-            ("Check Instagram Login", "check_login"),
+            ("Connect Account", "connect_account"),
+            ("Refresh Login", "refresh_login"),
+            ("Check Login", "check_login"),
+            ("Open Platform Home", "open_home"),
+            ("Reconnect Required", "reconnect_required"),
+            ("Clear Token", "clear_token"),
             ("Create Post", "create_post"),
             ("Reels", "open_reels"),
             ("Profile", "open_profile"),
@@ -199,6 +215,12 @@ PLATFORM_CONFIG: dict[str, dict[str, Any]] = {
             ("note", "Note", 220),
         ],
         "actions": [
+            ("Connect Account", "connect_account"),
+            ("Refresh Login", "refresh_login"),
+            ("Check Login", "check_login"),
+            ("Open Platform Home", "open_home"),
+            ("Reconnect Required", "reconnect_required"),
+            ("Clear Token", "clear_token"),
             ("Open WordPress Site", "open_home"),
             ("Open WordPress Admin", "open_admin"),
             ("Check API Login", "check_api"),
@@ -231,4 +253,3 @@ def platform_columns(platform: str) -> list[tuple[str, str, int]]:
 
 def platform_actions(platform: str) -> list[tuple[str, str]]:
     return list(PLATFORM_CONFIG.get(platform, PLATFORM_CONFIG["facebook"])["actions"])
-
