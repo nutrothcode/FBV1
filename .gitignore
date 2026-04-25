@@ -8,5 +8,10 @@ data/*.db
 backups/
 *.log
 Account Firefox/firefox/
+Facebook/Firefox Profiles/
+TikTok/Firefox Profiles/
+YouTube/Firefox Profiles/
+Instagram/Firefox Profiles/
+WordPress/Firefox Profiles/
 cookies/
 images/
